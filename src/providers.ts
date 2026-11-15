@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { childProcessEnvironment } from "./environment.js";
 import type { Provider } from "./types.js";
 
 export type Mode = "plan" | "execute" | "review";
@@ -62,6 +63,7 @@ export function hasBinary(bin: string): boolean {
       stdio: "ignore",
       timeout: 5000,
       shell: false,
+      env: childProcessEnvironment("binary-detection"),
     });
     return !run.error && run.status === 0;
   } catch {
@@ -87,7 +89,7 @@ export async function invokeAgent(
       cwd,
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,
-      env: { ...process.env, CI: "true" },
+      env: childProcessEnvironment(provider),
     });
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];

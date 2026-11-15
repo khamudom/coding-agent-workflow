@@ -173,7 +173,9 @@ Separate runs can use separate worktrees and terminals. Version 0.1 does not sch
 
 ## Security and limitations
 
-1. A Git worktree separates changes. It does not restrict secrets, credentials, or other host access. Use this on trusted code.
+Child processes receive explicit allowlisted environments. Provider authentication is sent only to the selected provider, while verification and internal Git commands receive no provider credentials. Stored Codex/Claude logins remain available through the allowed home and provider configuration directories. `CAW_CODEX_BIN` and `CAW_CLAUDE_BIN` select executables but are not forwarded. See [ADR-008](docs/ARCHITECTURE.md#adr-008-child-processes-receive-allowlisted-environments) for the exact variables and cloud-provider conditions.
+
+1. Environment filtering prevents accidental inheritance of unrelated host variables. It does not stop a child process from reading accessible credential files, keychains, credential helpers, local services, or other host resources. A Git worktree separates changes but does not provide a secret or host-access sandbox. Use this on trusted code.
 2. Codex plan and review calls use a read-only sandbox. Execution uses workspace write and does not receive `--add-dir` for a reference repository. Claude plan and review calls are limited to read tools. These provider controls depend on the installed CLI version and operating system. They are not a container boundary.
 3. Instructions in prompts can be ignored by a model. `caw` enforces stage order, command arguments, file hashes, and whether a reference repository changed during a read-only stage.
 4. Repository files and specifications are untrusted data. They can contain prompt injection. The role separation reduces that risk and does not eliminate it.
@@ -190,7 +192,7 @@ Separate runs can use separate worktrees and terminals. Version 0.1 does not sch
 npm test
 ```
 
-The tests cover specification validation, provider permission arguments, the approval gate, worktree isolation, verification, review, reference-file checks, and rejection of a reference repository that changes during planning.
+The tests cover specification validation, provider permission arguments, subprocess environment isolation, binary overrides, the approval gate, worktree isolation, verification, review, reference-file checks, and rejection of a reference repository that changes during planning.
 
 ## Further reading
 

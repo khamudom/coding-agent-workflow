@@ -7,6 +7,7 @@ import { hasBinary, invokeAgent } from "./providers.js";
 import { executePrompt, planPrompt, reviewPrompt } from "./prompts.js";
 import { assertReferenceFilesUnchanged, assertReferenceStable, captureReferenceFiles, referenceEvidence, referenceFingerprint, resolveReference, specFromPrompt } from "./references.js";
 import { validateSpecification } from "./spec.js";
+import { childProcessEnvironment } from "./environment.js";
 import type { CheckResult, Config, Provider, ReferenceRepo, Run } from "./types.js";
 
 const usage = `Code Agent Workflow — repository-independent, human-gated coding workflow
@@ -243,7 +244,12 @@ async function implement(repo: string, id: string): Promise<void> {
 async function runCommand(args: string[], cwd: string, logFile: string, timeoutMinutes: number): Promise<CheckResult> {
   const started = Date.now();
   return new Promise((resolve, reject) => {
-    const child = spawn(args[0]!, args.slice(1), { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, CI: "true" } });
+    const child = spawn(args[0]!, args.slice(1), {
+      cwd,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: childProcessEnvironment("verification"),
+    });
     const stdout: Buffer[] = [], stderr: Buffer[] = [];
     let completed = false;
     const timeout = setTimeout(() => child.kill("SIGTERM"), timeoutMinutes * 60 * 1000);

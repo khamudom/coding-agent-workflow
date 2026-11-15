@@ -2,12 +2,18 @@ import { createHash, randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, readdirSync, lstatSync, readlinkSync } from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { childProcessEnvironment } from "./environment.js";
 import type { Config, Run } from "./types.js";
 
 export const CONFIG_NAME = ".code-agent-workflow.json";
 export const STATE_DIR = ".code-agent-workflow";
 export function git(repo: string, args: string[]): string {
-  return execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  return execFileSync("git", args, {
+    cwd: repo,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    env: childProcessEnvironment("git"),
+  }).trim();
 }
 export function repoRoot(start = process.cwd()): string {
   try { return git(start, ["rev-parse", "--show-toplevel"]); }

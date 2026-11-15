@@ -44,7 +44,18 @@ function setup() {
   assert.equal(result.status, 0, result.stderr);
   const configFile = path.join(repo, ".code-agent-workflow.json");
   const config = JSON.parse(readFileSync(configFile, "utf8"));
-  config.verify = [[process.execPath, "-e", "require('node:fs').existsSync('output.txt') || process.exit(2)"]];
+  config.verify = [[process.execPath, "-e", `
+const env = process.env;
+if (env.CAW_TEST_SECRET_TOKEN || env.OPENAI_API_KEY || env.CODEX_API_KEY || env.ANTHROPIC_API_KEY || env.CLAUDE_CODE_OAUTH_TOKEN || env.CAW_CODEX_BIN) {
+  console.error("verification received a restricted environment variable");
+  process.exit(3);
+}
+if (!env.PATH || !(env.HOME || env.USERPROFILE) || env.CI !== "true") {
+  console.error("verification is missing a required system environment variable");
+  process.exit(4);
+}
+require("node:fs").existsSync("output.txt") || process.exit(2);
+`]];
   writeFileSync(configFile, JSON.stringify(config, null, 2));
   writeFileSync(path.join(repo, "specs", "ready-feature.md"), readySpec);
   git(repo, "add", ".");
@@ -95,7 +106,14 @@ test("end-to-end gated workflow with test agent and a separate Git worktree", as
   assert.ok(existsSync(path.join(metadata.worktree, "output.txt")));
   assert.equal(existsSync(path.join(repo, "output.txt")), false, "main repo must remain untouched");
   assert.equal(git(metadata.worktree, "rev-parse", "HEAD"), metadata.baseCommit, "must not auto-commit");
-  result = caw(repo, ["verify", runId], env);
+  result = caw(repo, ["verify", runId], {
+    ...env,
+    CAW_TEST_SECRET_TOKEN: "verification-secret",
+    OPENAI_API_KEY: "codex-secret",
+    CODEX_API_KEY: "codex-api-secret",
+    ANTHROPIC_API_KEY: "claude-secret",
+    CLAUDE_CODE_OAUTH_TOKEN: "claude-oauth-secret",
+  });
   assert.equal(result.status, 0, result.stderr);
   result = caw(repo, ["review", runId], env);
   assert.equal(result.status, 0, result.stderr);
@@ -159,7 +177,7 @@ test("plan rejects an incomplete specification before invoking an agent", () => 
   assert.equal(existsSync(marker), false);
 });
 
-function pair(mock: string) {
+function pair(mock: string, options: {citedFile?: string; mutateReference?: boolean} = {}) {
   const parent = mkdtempSync(path.join(os.tmpdir(), "caw-port-"));
   const repo = path.join(parent, "repo-a");
   const reference = path.join(parent, "repo-b");
@@ -184,7 +202,11 @@ function pair(mock: string) {
   git(repo, "commit", "-qm", "workflow config");
   const fake = path.join(repo, ".code-agent-workflow", "mock-agent.cjs");
   mkdirSync(path.dirname(fake), {recursive: true});
-  writeFileSync(fake, mock);
+  writeFileSync(fake, mock
+    .replace("__ARGV_FILE__", JSON.stringify(path.join(parent, "argv.log")))
+    .replace("__STDIN_FILE__", JSON.stringify(path.join(parent, "stdin.log")))
+    .replace("__CITED_FILE__", JSON.stringify(options.citedFile ?? "quest.ts"))
+    .replace("__MUTATE_REFERENCE__", options.mutateReference ? JSON.stringify(path.join(reference, "quest.ts")) : "undefined"));
   chmodSync(fake, 0o755);
   return {parent, repo, reference, fake};
 }
@@ -193,17 +215,18 @@ const portMock = `#!/usr/bin/env node
 const fs = require("node:fs");
 const args = process.argv.slice(2);
 if (args.includes("--version")) { console.log("mock 1.0"); process.exit(0); }
-if (process.env.CAW_ARGV_FILE) fs.appendFileSync(process.env.CAW_ARGV_FILE, process.argv.join(" ") + "\\n");
+fs.appendFileSync(__ARGV_FILE__, process.argv.join(" ") + "\\n");
 const text = fs.readFileSync(0, "utf8");
-if (process.env.CAW_STDIN_FILE) fs.appendFileSync(process.env.CAW_STDIN_FILE, text + "\\n---\\n");
+fs.appendFileSync(__STDIN_FILE__, text + "\\n---\\n");
 if (text.includes("ROLE: Implementer")) {
   fs.writeFileSync("output.txt", "feature implemented\\n");
   console.log("Implemented the feature");
 } else if (text.includes("ROLE: Independent code reviewer")) {
   console.log("# Verdict\\nPASS\\n# Findings\\nNo findings");
 } else if (text.includes("ROLE: Repository-aware planning agent")) {
-  if (process.env.CAW_MUTATE_REFERENCE) fs.appendFileSync(process.env.CAW_MUTATE_REFERENCE, "\\nmutated\\n");
-  const cited = process.env.CAW_CITED_FILE || "quest.ts";
+  const mutateReference = __MUTATE_REFERENCE__;
+  if (mutateReference) fs.appendFileSync(mutateReference, "\\nmutated\\n");
+  const cited = __CITED_FILE__;
   console.log("# Goal\\nPort quest\\n# Reference files\\n- " + cited + "\\n");
 } else { console.error("Unexpected prompt"); process.exit(4); }
 `;
@@ -212,7 +235,7 @@ test("prompt and reference repository produce a checked plan and read-only execu
   const {parent, repo, reference} = pair(portMock);
   const argvFile = path.join(parent, "argv.log");
   const stdinFile = path.join(parent, "stdin.log");
-  const env = {CAW_CODEX_BIN: path.join(repo, ".code-agent-workflow", "mock-agent.cjs"), CAW_ARGV_FILE: argvFile, CAW_STDIN_FILE: stdinFile};
+  const env = {CAW_CODEX_BIN: path.join(repo, ".code-agent-workflow", "mock-agent.cjs")};
   const planned = caw(repo, ["plan", "--prompt", "Port the quest feature from repo-b. Reimplement it using this repository's patterns.", "--reference", "../repo-b", "--provider", "codex"], env);
   assert.equal(planned.status, 0, planned.stderr);
   const id = planned.stdout.match(/Run ID: (run-[0-9TZ-]+-[a-f0-9]{8})/)?.[1];
@@ -238,8 +261,8 @@ test("prompt and reference repository produce a checked plan and read-only execu
 });
 
 test("a plan cannot cite a reference file that does not exist", () => {
-  const {repo} = pair(portMock);
-  const env = {CAW_CODEX_BIN: path.join(repo, ".code-agent-workflow", "mock-agent.cjs"), CAW_CITED_FILE: "missing.ts"};
+  const {repo} = pair(portMock, {citedFile: "missing.ts"});
+  const env = {CAW_CODEX_BIN: path.join(repo, ".code-agent-workflow", "mock-agent.cjs")};
   const planned = caw(repo, ["plan", "--prompt", "Port the quest feature.", "--reference", "../repo-b"], env);
   assert.notEqual(planned.status, 0);
   assert.match(planned.stderr, /Reference file does not exist: missing.ts/);
@@ -258,8 +281,8 @@ test("changing the reference prototype blocks approval", () => {
 });
 
 test("a reference write during planning rejects the run", () => {
-  const {repo, reference} = pair(portMock);
-  const env = {CAW_CODEX_BIN: path.join(repo, ".code-agent-workflow", "mock-agent.cjs"), CAW_MUTATE_REFERENCE: path.join(reference, "quest.ts")};
+  const {repo} = pair(portMock, {mutateReference: true});
+  const env = {CAW_CODEX_BIN: path.join(repo, ".code-agent-workflow", "mock-agent.cjs")};
   const planned = caw(repo, ["plan", "--prompt", "Port the quest feature.", "--reference", "../repo-b"], env);
   assert.notEqual(planned.status, 0);
   assert.match(planned.stderr, /Reference repository changed during read-only access/);
