@@ -175,8 +175,14 @@ Separate runs can use separate worktrees and terminals. Version 0.1 does not sch
 
 Child processes receive explicit allowlisted environments. Provider authentication is sent only to the selected provider, while verification and internal Git commands receive no provider credentials. Stored Codex/Claude logins remain available through the allowed home and provider configuration directories. `CAW_CODEX_BIN` and `CAW_CLAUDE_BIN` select executables but are not forwarded. See [ADR-008](docs/ARCHITECTURE.md#adr-008-child-processes-receive-allowlisted-environments) for the exact variables and cloud-provider conditions.
 
+Plan, execute, and review request no MCP tools. This is a provider command restriction, separate from the Codex sandbox, Claude's built-in tool list, and the child-environment allowlist. A Git worktree still only isolates the checkout. A passing local scan is not proof that every MCP source is disabled. See [ADR-009](docs/ARCHITECTURE.md#adr-009-mcp-tools-are-denied-by-default).
+
+Claude receives `--strict-mcp-config` and `--disallowedTools mcp__*`, and receives no `--mcp-config`. Its existing read and edit tools stay available. `--strict-mcp-config` tells current Claude Code to ignore user, project, and plugin MCP configuration. `mcp__*` removes MCP tools from the model context. `caw` refuses to start Claude when a managed MCP file is deployed, because that flag cannot replace it. Remote managed MCP settings are not visible locally. A CLI that accepts the flags and still exposes a managed tool is outside this check.
+
+Codex receives `--ignore-user-config`. Authentication still uses `CODEX_HOME`, and the stage sandbox is unchanged. The flag skips `$CODEX_HOME/config.toml`, including user MCP servers and saved project trust. It does not clear system, managed, or cloud MCP configuration, and `-c 'mcp_servers={}'` is not used because current Codex releases do not clear servers that way. `caw` parses project and host TOML and refuses the run when a relevant file defines MCP servers, plugins, hooks, or an `mcp_tool` hook, or when that file is malformed or unreadable. Comments and ordinary strings do not count. Cloud-managed Codex configuration, macOS managed preferences, Windows registry policy, app connectors, and the remote plugin catalog can still supply MCP tools. Codex provides no supported flag that skips them. A strict guarantee needs a container or VM that does not expose those sources or the host keyring. User model preferences in `config.toml` are not applied during a `caw` run.
+
 1. Environment filtering prevents accidental inheritance of unrelated host variables. It does not stop a child process from reading accessible credential files, keychains, credential helpers, local services, or other host resources. A Git worktree separates changes but does not provide a secret or host-access sandbox. Use this on trusted code.
-2. Codex plan and review calls use a read-only sandbox. Execution uses workspace write and does not receive `--add-dir` for a reference repository. Claude plan and review calls are limited to read tools. These provider controls depend on the installed CLI version and operating system. They are not a container boundary.
+2. Codex plan and review calls use a read-only sandbox. Execution uses workspace write and does not receive `--add-dir` for a reference repository. Claude plan and review calls are limited to read tools. The read-only sandbox restricts writes. It does not guarantee that filesystem reads stay inside the repository. Planning and review prompts may allow native read-only commands such as `ls`, `rg`, `cat`, and `git show`; those sentences are not the write boundary. These provider controls depend on the installed CLI version and operating system. They are not a container boundary.
 3. Instructions in prompts can be ignored by a model. `caw` enforces stage order, command arguments, file hashes, and whether a reference repository changed during a read-only stage.
 4. Repository files and specifications are untrusted data. They can contain prompt injection. The role separation reduces that risk and does not eliminate it.
 5. Run logs can contain source code or sensitive data. The run directory is gitignored. Remove sensitive content before sharing a report. `caw` uploads no telemetry. The provider CLI may send repository content to its service under your account settings.
@@ -192,7 +198,13 @@ Child processes receive explicit allowlisted environments. Provider authenticati
 npm test
 ```
 
-The tests cover specification validation, provider permission arguments, subprocess environment isolation, binary overrides, the approval gate, worktree isolation, verification, review, reference-file checks, and rejection of a reference repository that changes during planning.
+The tests cover specification validation, provider permission arguments, local MCP preflight checks, subprocess environment isolation, binary overrides, the approval gate, worktree isolation, verification, review, reference-file checks, and rejection of a reference repository that changes during planning. `npm test` does not invoke Codex or Claude. MCP coverage is three separate kinds of evidence. Argument tests record the command this process builds. They do not prove that an installed binary honored the MCP flags. Local preflight tests reject project and host configuration this process can inspect, and they refuse the run when Git discovery or a configuration read fails. Real-provider checks live in `tests/mcp-provider-probe.test.ts` and stay skipped until you opt in. On a disposable machine with no Codex login, keyring entry, or managed policy, run:
+
+```bash
+CAW_MCP_PROVIDER_PROBE=1 npm test
+```
+
+That runs `codex mcp list` against a local server definition and a `codex exec` comparison with and without `--ignore-user-config`. `codex mcp list` does not start the server and cannot apply `--ignore-user-config`, so the exec comparison is the launch check.
 
 ## Further reading
 

@@ -77,6 +77,83 @@ Third-party Claude backends are opt-in. A selector is enabled only when its trim
 
 This boundary prevents accidental inheritance of unrelated variables such as repository tokens, package registry credentials, SSH agent sockets, and arbitrary host secrets. It does not prevent a provider, agent tool, Git hook, or verification command from reading accessible files, keychains, credential helpers, local services, or other host resources. Provider credentials necessarily exist in the selected provider process and may be visible to subprocesses that provider starts, subject to that CLI's own scrubbing behavior. Environment isolation is therefore defense in depth, not a sandbox.
 
+## ADR-009: MCP tools are denied by default
+
+Plan, execute, and review request no MCP tools. The provider command and local checks enforce that request. Prompt text is not the control. There is no project setting that allowlists MCP servers. A local check that passes does not prove every MCP source is disabled. Approved MCP integrations can be added later as a separate feature.
+
+MCP restriction, process sandboxing, and environment filtering are three different controls. Claude's `--tools` list and Codex's `--sandbox` value bound built-in file and command tools. The child-environment allowlist chooses inherited variables. MCP policy chooses whether MCP servers and MCP tools are available. A Git worktree isolates the checkout being edited. None of these controls is a container.
+
+The sources below are classified by what this process can actually do.
+
+Explicitly disabled:
+
+- Claude user, project, and plugin MCP configuration, through `--strict-mcp-config` with no `--mcp-config`. MCP tool names, through `--disallowedTools mcp__*`.
+- The Codex user layer in `$CODEX_HOME/config.toml`, through `--ignore-user-config`. Authentication still uses `CODEX_HOME`.
+
+Validated and rejected before the process starts:
+
+- A readable Claude `managed-mcp.json` on the platform path, including an empty file.
+- A Codex project `.codex/config.toml` whose parsed document defines `mcp_servers`, `plugins`, `hooks`, or an `mcp_tool` hook. Quoted, dotted, nested, and inline tables count. A comment or an ordinary string does not.
+- A Codex project `.codex/hooks.json`, because project hooks load when any remaining layer trusts the project.
+- `$CODEX_HOME/hooks.json` when it contains an `mcp_tool` hook or is not valid JSON.
+- System and legacy managed Codex config files when the parsed document defines those entries.
+- Requirements files when the parsed document defines an `mcp_tool` hook. An `mcp_servers` allowlist there disables non-matching servers, so its presence does not refuse the run.
+- Malformed TOML in any of those Codex files. That is a failure to validate, not evidence that no MCP server exists.
+- A Git inspection failure, including `.git` metadata that Git cannot read. A directory that is not a Git repository is scanned only at that directory. A missing optional file is absence. Permission errors and other filesystem errors refuse the run.
+
+Potentially active, and not observable from this process:
+
+- Codex cloud-managed configuration.
+- macOS managed preferences.
+- The Windows Codex policy registry under `SOFTWARE\Policies\OpenAI\Codex`.
+- Codex app connectors and the remote plugin catalog.
+- Claude `managedMcpServers` delivered without a local `managed-mcp.json`.
+- Command hooks that are not `mcp_tool` hooks. Those hooks still run.
+
+A strict guarantee needs an execution environment that does not include those unobservable sources. That means a container or VM whose provider process cannot read the host keyring, host managed preferences, or a cloud policy for the provider account. This harness does not create that environment. `caw doctor` and the startup line name the gap. They do not close it.
+
+### Claude Code
+
+Every Claude stage passes `--strict-mcp-config` and `--disallowedTools mcp__*`, and passes no `--mcp-config`. Current Claude Code help describes `--strict-mcp-config` as using only the servers supplied by `--mcp-config` and ignoring other MCP configurations, including user, project, and plugin servers. Current permission docs say `--tools` does not affect MCP tools, and a bare `mcp__*` deny removes every MCP tool from the model context, including plugin tools whose names start with `mcp__`.
+
+The existing tool boundary stays in place. Plan uses `--permission-mode plan` and `Read,Glob,Grep`. Execute and review use `dontAsk`. Execute adds `Edit,Write,MultiEdit`. Reference directories are still mounted only for plan and review. `--bare` is not used: that mode does not read OAuth or keychain credentials. `--safe-mode` is not used: it disables project instructions, skills, and hooks beyond the MCP boundary.
+
+`caw` refuses to start Claude when a managed MCP file is present:
+
+- macOS: `/Library/Application Support/ClaudeCode/managed-mcp.json`
+- Linux: `/etc/claude-code/managed-mcp.json`
+- Windows: `C:\Program Files\ClaudeCode\managed-mcp.json`
+
+Current Claude Code docs say `--strict-mcp-config` exits when that file is deployed, and the file can force its own server set. The refusal happens before the process starts. Absence of the file is not proof that remote managed settings are absent.
+
+`managedMcpServers` without that file is omitted by `--strict-mcp-config` in the current docs, and `mcp__*` removes a tool that still appears. Those settings can be fetched from the network, so `caw` cannot inspect them. An older CLI that rejects either flag fails the stage. A CLI that accepts the flags and still exposes a managed MCP tool is outside what `caw` can detect. Claude settings, skills, and command hooks still load; a hook can run a program even when MCP tools are removed.
+
+### Codex
+
+Every Codex stage passes `exec --ephemeral --ignore-user-config` and the existing sandbox: `read-only` for plan and review, `workspace-write` for execution. The read-only sandbox restricts writes. It does not guarantee filesystem read isolation. Planning and review prompts allow `ls`, `rg`, `cat`, and `git show` so Codex can inspect the repository without MCP. Those prompt lines are not the security boundary. The flag's documented contract is that `$CODEX_HOME/config.toml` is not loaded and authentication still uses `CODEX_HOME`. That removes user MCP servers, user preferences, inline hooks in that file, and project trust saved in that file. `CODEX_HOME`, `OPENAI_API_KEY`, `CODEX_API_KEY`, and the other Codex authentication variables from ADR-008 are still forwarded.
+
+The command does not pass `-c 'mcp_servers={}'`. Current Codex releases merge that empty table and leave configured servers enabled. It does not pass `--trust`, which would enable project configuration and cannot be combined with `--ignore-user-config`. It does not pass `--ignore-rules`, because that skips user and project execpolicy `.rules` files and those rules can only add command restrictions. It does not pass `--dangerously-bypass-approvals-and-sandbox`.
+
+Project `.codex` configuration still loads when a remaining layer trusts the project. System config, legacy managed config, cloud-managed config, and macOS managed preferences can grant that trust. `caw` therefore refuses to start Codex when either of these is found from the working directory through the Git root, and in the main checkout of a linked worktree:
+
+- `.codex/config.toml` parses as a document that defines `mcp_servers`, `plugins`, `hooks`, or an `mcp_tool` hook
+- `.codex/hooks.json` exists
+
+Detection parses TOML. `["mcp_servers".probe]`, `['mcp_servers'.probe]`, dotted keys, and inline tables are the same configuration as `[mcp_servers.probe]`. A comment, a string value, or a single quoted key whose name merely contains `mcp_servers` is not. Malformed TOML refuses the run. An unreadable configuration file refuses the run. A file that is not present does not.
+
+`$CODEX_HOME/hooks.json` still loads. The user config layer is empty, and hook discovery still reads that directory. `caw` refuses the run when that file contains an `mcp_tool` hook or is not valid JSON. Command hooks in that file still run.
+
+These host files still load, and `caw` refuses the run when a parsed config file defines `mcp_servers`, `plugins`, `hooks`, or `mcp_tool`, or when the file cannot be parsed:
+
+- Unix: `/etc/codex/config.toml`, `/etc/codex/managed_config.toml`
+- Windows: `%ProgramData%\OpenAI\Codex\config.toml`
+
+`/etc/codex/requirements.toml` and `%ProgramData%\OpenAI\Codex\requirements.toml` constrain the client. An `mcp_servers` entry there is an allowlist that disables non-matching servers, so its presence does not refuse the run. An `mcp_tool` hook in that file refuses the run. Malformed requirements TOML also refuses the run. Command hooks in that file still run.
+
+Cloud-managed configuration, macOS managed preferences, and the Windows Codex policy registry can still supply MCP servers, plugins, and project trust. Codex has no supported CLI flag that skips those layers, and `caw` cannot read them. A scan that finds no readable violation does not prove those sources are disabled. Codex app connectors and the remote plugin catalog are separate from `mcp_servers`; `--ignore-user-config` does not disable them. A strict guarantee requires the isolated execution environment described above.
+
+User model and approval preferences stored in `config.toml` are not applied during a `caw` run. The explicit `--sandbox` value still selects the stage sandbox, and reference directories are still withheld from execution. An installed Codex that rejects `--ignore-user-config` fails the stage instead of running with user MCP servers loaded.
+
 ## Non-goals for v0.1
 
 Production CI/CD automation; database persistence; distributed queues; cloud execution; autonomous PR/merge; managing authentication; robust secret redaction; arbitrary repo dependency bootstrap; cross-worktree dependency graphs; UI dashboard.

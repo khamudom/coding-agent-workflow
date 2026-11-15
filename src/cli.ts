@@ -110,6 +110,7 @@ async function doctor(repo: string): Promise<void> {
   console.log(`Default: ${config.defaultProvider}; verify commands: ${config.verify.length}`);
   if (config.verify.length === 0) console.log("WARNING: Configure nonempty verify commands to make the verification gate meaningful.");
   console.log("Safety: only use trusted repositories; a Git worktree isolates changes, not shell processes or secrets.");
+  console.log("MCP: Claude requests --strict-mcp-config and denies mcp__*. Codex requests --ignore-user-config and refuses readable project or host MCP configuration. A passing local check does not cover cloud-managed Codex configuration, macOS managed preferences, or remote Claude managed MCP settings.");
 }
 
 async function withStableReferences<T>(references: ReferenceRepo[], action: () => Promise<T>): Promise<T> {
