@@ -162,6 +162,45 @@ function containedFile(root: string, full: string): boolean {
   return stat.isFile() || lstatSync(realFile).isFile();
 }
 
+export function resolvePlanReference(
+  entry: {repository: string; path: string},
+  references: readonly ReferenceRepo[],
+): ReferenceFile {
+  const repository = matchReferenceRepository(entry.repository, references);
+  const listed = entry.path;
+  if (listed.includes("\\") || path.isAbsolute(listed) || listed.split("/").includes("..")) {
+    throw new Error(`Reference file must be a relative path inside a reference repository: ${listed}`);
+  }
+  const relative = listed.replace(/^\.\//, "");
+  if (!relative || relative.split("/").some(part => part === "" || part === ".")) {
+    throw new Error(`Reference file must be a relative path inside a reference repository: ${listed}`);
+  }
+  const full = path.resolve(repository.path, ...relative.split("/"));
+  if (!existsSync(full)) throw new Error(`Reference file does not exist: ${listed}`);
+  if (!containedFile(repository.path, full)) throw new Error(`Reference file is not a file inside the repository: ${listed}`);
+  const bytes = readFileSync(full);
+  return {repository: repository.path, path: relative, sha256: createHash("sha256").update(bytes).digest("hex")};
+}
+
+function matchReferenceRepository(requested: string, references: readonly ReferenceRepo[]): ReferenceRepo {
+  const stripped = requested.length > 1 ? requested.replace(/[\\/]+$/, "") : requested;
+  if (!path.isAbsolute(stripped)) {
+    throw new Error(`reference repository must be an absolute path from the provided reference repositories: ${requested}`);
+  }
+  const exact = references.filter(reference => reference.path === requested || reference.path === stripped);
+  if (exact.length === 1) return exact[0]!;
+  if (exact.length > 1) throw new Error(`ambiguous reference repository: ${requested}`);
+  let real: string;
+  try {
+    real = realpathSync(stripped);
+  } catch {
+    throw new Error(`reference repository was not part of this run: ${requested}`);
+  }
+  const matches = references.filter(reference => reference.path === real);
+  if (matches.length !== 1) throw new Error(`reference repository was not part of this run: ${requested}`);
+  return matches[0]!;
+}
+
 function readCitedFile(file: ReferenceFile): ReferenceFile {
   const full = path.resolve(file.repository, file.path);
   if (!existsSync(full) || !containedFile(file.repository, full)) throw new Error(`Reference file is no longer available: ${file.path}`);

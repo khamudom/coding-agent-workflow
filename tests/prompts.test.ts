@@ -14,7 +14,33 @@ test("planning permits native read-only inspection and still prohibits project e
   assert.match(prompt, /tests, builds, installations, project scripts, deployments, or network requests/);
   assert.match(prompt, /label each item as verified from a file you read or as an assumption/);
   assert.match(prompt, /If inspection is unavailable/);
+  assert.match(prompt, /plan\.json/);
+  assert.match(prompt, /Do not write those files/);
+  assert.match(prompt, /\[\["npm","test"\]\]/);
+  assert.doesNotMatch(prompt, /Use this exact Markdown structure/);
   assert.doesNotMatch(prompt, /Do not run tests or shell commands/);
+});
+
+test("planning treats empty verification as a blocker outside the current run", () => {
+  const prompt = planPrompt("Add a dialog.");
+  assert.match(prompt, /Use "\." for an observation about the repository root/);
+  assert.match(prompt, /\[\["npm","test"\]\]/);
+  assert.match(prompt, /not shell-command strings/);
+  assert.match(prompt, /Planning must not run commands or modify configuration/);
+  assert.match(prompt, /approved verify commands from the original repository's \.code-agent-workflow\.json/);
+  assert.match(prompt, /Editing that file in the implementation worktree does not change the commands for the current run/);
+  assert.match(prompt, /If verify is empty, identify that as a blocker to completing this workflow/);
+  assert.match(prompt, /Configure and commit verification commands in the original repository, then start a new planning run/);
+  assert.match(prompt, /Do not recommend changing \.code-agent-workflow\.json during implementation to satisfy the current run's verification gate/);
+  assert.match(prompt, /Do not modify files/);
+  assert.doesNotMatch(prompt, /may recommend configuration changes/);
+});
+
+test("implementation cannot retarget the current run's verification commands", () => {
+  const prompt = executePrompt("spec", "plan");
+  assert.match(prompt, /Do not run shell commands/);
+  assert.match(prompt, /approved commands from the original repository's \.code-agent-workflow\.json/);
+  assert.match(prompt, /Editing that file in this worktree does not change the commands for the current run/);
 });
 
 test("review can inspect source files without modifying them", () => {

@@ -10,7 +10,7 @@ This framework owns **workflow orchestration**: local state, approval policy, pr
 |---|---|---|
 | CLI coordinator | Validate transitions, create run IDs, capture timestamps | Trusted local code |
 | Spec snapshot | User intent and acceptance criteria | Untrusted data |
-| Planner | Repo reconnaissance and plan generation | Probabilistic, read-only |
+| Planner | Repo reconnaissance and a schema version 1 plan | Probabilistic, read-only |
 | Human plan gate | Explicit sign-off of plan snapshot | Human decision |
 | Implementer | Scoped edits to a worktree | Probabilistic, write enabled |
 | Verifier | Commands from committed config | Deterministic process outcomes, not necessarily complete coverage |
@@ -23,7 +23,7 @@ Start with a small CLI that can be installed once and run against many repos. It
 
 ## ADR-002: Explicit spec and plan checkpoint
 
-Plan acceptance is manual, separated from model generation. A SHA256 digest of the spec and approved plan discourages accidental plan drift. Changes must result in a new run, not silent substitution.
+Plan acceptance is manual, separated from model generation. A SHA256 digest of the spec and approved plan discourages accidental plan drift. New runs hash both `plan.json` and the generated `plan.md`. Changes must result in a new run, not silent substitution.
 
 ## ADR-003: A fresh reviewer, not self-approval
 
@@ -153,6 +153,16 @@ These host files still load, and `caw` refuses the run when a parsed config file
 Cloud-managed configuration, macOS managed preferences, and the Windows Codex policy registry can still supply MCP servers, plugins, and project trust. Codex has no supported CLI flag that skips those layers, and `caw` cannot read them. A scan that finds no readable violation does not prove those sources are disabled. Codex app connectors and the remote plugin catalog are separate from `mcp_servers`; `--ignore-user-config` does not disable them. A strict guarantee requires the isolated execution environment described above.
 
 User model and approval preferences stored in `config.toml` are not applied during a `caw` run. The explicit `--sandbox` value still selects the stage sandbox, and reference directories are still withheld from execution. An installed Codex that rejects `--ignore-user-config` fails the stage instead of running with user MCP servers loaded.
+
+## ADR-010: Structured plans are validated locally
+
+New planning runs use schema version 1. The provider may also be given that schema. Codex receives `--output-schema` and `--output-last-message` and is not run with `--json`. Claude receives `--output-format json` and `--json-schema`. Codex output is the last-message file. Claude output is the `structured_output` field of the result envelope. Stdout diagnostics, JSONL events, and Claude's `result` text are not the plan.
+
+The orchestrator parses that channel, validates the object, and writes `plan.json` and `plan.md`. The agent does not write those files. Local validation repeats the structural checks even when the provider claims the schema was enforced. It rejects unsupported versions, missing or blank required fields, duplicate step or acceptance-criterion ids, links to unknown criteria, verification commands that are not argv arrays, and reference-file entries that are absolute, missing, duplicated, or outside a provided reference repository. Reference containment and content fingerprints stay in place. Array order is the step order. Ids are labels, not a task graph.
+
+A valid document is not a true document. `verified` is a model claim. Suggested commands are not executed and are not copied into project configuration. Security, accessibility, and rollback must each appear as a risk category, which only means the plan names them.
+
+Planning stores hashes of both artifacts. Approval rejects any change to those bytes and checks that `plan.json` names the reference files fingerprinted during planning. Execution and review compare the approved hashes with that same reference binding. `plan.md` escapes structural markers in field text so a value cannot impersonate another section or close the approved-plan prompt. A failed plan is `planning_failed` and creates no worktree. `planFormat` is set to `structured` before the agent returns, so a new run cannot be approved as an older Markdown-only run. Runs that have no `planFormat` keep the previous Markdown lifecycle. Review findings remain Markdown until a later schema.
 
 ## Non-goals for v0.1
 

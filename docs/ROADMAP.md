@@ -2,11 +2,11 @@
 
 ## Now: v0.1 (included)
 
-Git-isolated stage machine; Markdown specification or prompt; optional read-only reference repository; explicit plan approval; Codex and Claude Code command adapters; deterministic verification; independent reviewer; artifact trail; offline tests with a mock agent.
+Git-isolated stage machine; Markdown specification or prompt; optional read-only reference repository; explicit plan approval; schema version 1 plans (`plan.json` and generated `plan.md`); Codex and Claude Code command adapters; deterministic verification; independent reviewer; artifact trail; offline tests with a mock agent.
 
 ## Next: production-worthy harness
 
-1. **Structured schemas:** Validate plan tasks and review findings against versioned JSON schemas rather than trusting loose Markdown.
+1. **Structured review findings:** Plan tasks are validated against schema version 1. Review findings are still Markdown. Validate reviewer verdicts against a versioned schema in the same way.
 2. **Strong isolation:** Per-task container/VM execution, secret stripping, network policy, repository allowlists, time limits, non-root runner.
 3. **Run resumption / recovery:** Persist idempotent state transitions; safe retries; no orphan worktrees; clear cancellation.
 4. **Evaluation suite:** Fixed cross-repo tasks, held-out acceptance tests, scoring by human reviewers, cost/time metrics.

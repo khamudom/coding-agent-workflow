@@ -9,8 +9,8 @@ This is v0.1. It is a local tool, not a hosted platform. The test suite drives a
 ## What a run does
 
 1. You supply a Markdown specification, or a prompt that `caw` saves as one.
-2. A read-only planner inspects the repository and writes `plan.md`.
-3. You read the plan and approve that exact snapshot.
+2. A read-only planner inspects the repository. `caw` validates the structured result and writes `plan.json` and `plan.md`.
+3. You read `plan.md` and approve that exact snapshot. `plan.json` is approved with it.
 4. The implementer edits an isolated Git branch and worktree.
 5. The verification commands in `.code-agent-workflow.json` must pass.
 6. A fresh read-only reviewer reports findings. Its verdict does not approve the change.
@@ -75,7 +75,7 @@ git add .code-agent-workflow.json .gitignore specs/example-feature.md
 git commit -m "Configure Code Agent Workflow"
 
 caw plan specs/example-feature.md --provider codex
-# Inspect .code-agent-workflow/runs/<run-id>/plan.md
+# Inspect .code-agent-workflow/runs/<run-id>/plan.md and plan.json
 
 caw approve <run-id>
 caw run <run-id>
@@ -110,7 +110,7 @@ caw metrics
 }
 ```
 
-Each `verify` entry is an argument array and is executed with `shell: false`. Replace the examples with the target project's commands, such as `["python", "-m", "pytest"]`, `["go", "test", "./..."]`, or `["dotnet", "test"]`. An empty list disables the gate, and `caw verify` refuses to run it.
+Each `verify` entry is an argument array and is executed with `shell: false`. Replace the examples with the target project's commands, such as `["python", "-m", "pytest"]`, `["go", "test", "./..."]`, or `["dotnet", "test"]`. An empty list disables the gate, and `caw verify` refuses to run it. Verification reads this file from the original repository. The command list is fixed when the plan is approved. Editing the copy in the implementation worktree does not change the current run.
 
 ## Specification format
 
@@ -122,7 +122,54 @@ A specification file needs three sections:
 
 `caw plan` rejects missing sections, empty sections, and obvious placeholders. See `examples/dialog-component.spec.md`. A `--prompt` request is saved as a specification snapshot for that run; you do not have to create the file yourself.
 
-The planner is expected to inspect the repository and turn the request into `plan.md`. When a reference repository is present, that plan must include a `# Reference files` section listing the relative paths it actually inspected.
+The planner inspects the repository and returns a schema version 1 JSON object. `caw` validates it and writes `plan.json`. `plan.md` is generated from that object for review. When a reference repository is present, `referenceFiles` must name real files in that repository. The generated Markdown lists those paths under `# Reference files`.
+
+## Structured plans
+
+`plan.json` is the canonical plan for every new run. `plan.md` is the human-readable copy generated from it. Review `plan.md` before `caw approve`. The agent is not asked to write either file.
+
+Schema version 1 requires a goal, included and excluded scope, observations, assumptions, unanswered questions, ordered implementation steps, acceptance criteria, verification suggestions, risks, and reference files. Each step and acceptance criterion has a stable id. A step names the criterion ids it satisfies. Observation status is `verified` or `assumed`. An observation path is repository-relative, and `.` means the repository root. Risks include `security`, `accessibility`, and `rollback`.
+
+Verification commands use the same argv shape as project configuration:
+
+```json
+"verification": {
+  "commands": [["npm", "test"], ["npm", "run", "build"]],
+  "manualChecks": ["Retry the dialog with a keyboard."]
+}
+```
+
+Those commands are recommendations in argv form, not shell-command strings. `caw` does not run them during planning and does not write them into `.code-agent-workflow.json`. An empty `verify` list is a blocker for the current run. Configure and commit commands in the original repository, then start a new planning run. Changing `.code-agent-workflow.json` during implementation does not satisfy that gate.
+
+`caw plan` asks Codex for `--output-schema` and reads only `--output-last-message`. It does not use `--json`, because intermediate events can already look like a finished plan. Claude is asked for `--output-format json` and `--json-schema`. The plan is the envelope's `structured_output` field. The `result` string is not the plan. Both providers are validated again locally. A provider that lacks the flag fails the run. Markdown or a sentence such as a file-save failure is not accepted.
+
+Planning records SHA-256 hashes of the generated `plan.json` and `plan.md`. Approval accepts those files only when the bytes are unchanged and `referenceFiles` is still the list fingerprinted during planning. Editing either artifact, or changing which reference files it names, requires a new `caw plan` run. Execution and review reject a later change and use that captured reference evidence. Generated Markdown keeps multiline text and code examples, and escapes structural markers in field text so a value cannot impersonate another section or close the approved-plan prompt. A failed plan stays `planning_failed`, is not approvable, and does not create a worktree. The agent log and, for Codex, `plan-last-message.json` keep the rejected output.
+
+Runs saved before this contract have no `planFormat`. They still approve and execute from `plan.md`. `caw plan` always sets `planFormat` to `structured`, including when planning fails, so a new run cannot skip validation by keeping only Markdown.
+
+A small plan with no reference repository:
+
+```json
+{
+  "schemaVersion": 1,
+  "goal": "Close the dialog when Escape is pressed.",
+  "scope": {"included": ["Handle Escape in the dialog"], "excluded": ["Changing focus trapping"]},
+  "observations": [{"path": "src/dialog.ts", "finding": "The dialog has no Escape handler.", "status": "verified"}],
+  "assumptions": [],
+  "unansweredQuestions": [],
+  "implementationSteps": [{"id": "escape", "task": "Close the dialog from the Escape key.", "acceptanceCriteria": ["escape-closes"]}],
+  "acceptanceCriteria": [{"id": "escape-closes", "requirement": "Pressing Escape closes the open dialog."}],
+  "verification": {"commands": [["npm", "test"]], "manualChecks": ["Open the dialog and press Escape."]},
+  "risks": [
+    {"category": "security", "description": "No new trust boundary.", "mitigation": "Do not read secrets."},
+    {"category": "accessibility", "description": "Escape is the expected keyboard dismiss.", "mitigation": "Keep the existing focus trap."},
+    {"category": "rollback", "description": "The worktree can be discarded.", "mitigation": "Do not merge automatically."}
+  ],
+  "referenceFiles": []
+}
+```
+
+With `--reference`, each `referenceFiles` entry uses that repository's absolute path and a relative file path. The path must exist, stay inside the repository, and is fingerprinted. Two reference repositories can cite the same relative path when each entry names its repository.
 
 ## Workflow
 
@@ -130,7 +177,7 @@ The planner is expected to inspect the repository and turn the request into `pla
 Specification file or prompt
     |
     v
-[Planner: read-only, optional reference repository] -> plan.md
+[Planner: read-only, optional reference repository] -> plan.json + plan.md
     |
     v
 [HUMAN: approve the plan snapshot]
@@ -160,7 +207,10 @@ Separate runs can use separate worktrees and terminals. Version 0.1 does not sch
     runs/<run-id>/
       run.json                     # state, hashes, timeline, and outcomes
       spec.md                      # snapshotted request
-      plan.md                      # planner output and approved content
+      plan.json                    # canonical structured plan
+      plan.md                      # Markdown generated from plan.json
+      plan.schema.json             # schema passed to the provider
+      plan-last-message.json       # Codex final message, when Codex is the planner
       plan-agent.log
       execution-agent.log
       verify-1.log
@@ -190,7 +240,7 @@ Codex receives `--ignore-user-config`. Authentication still uses `CODEX_HOME`, a
 7. The worktree fingerprint detects ordinary tracked and untracked changes between verification and review. It is not a tamper-proof attestation.
 8. Reviewer findings are advisory. An AI reviewer can miss defects. Read the diff and rely on independent CI before merging.
 9. Automated tests use a mock agent. Run `caw doctor` and test the real provider on a disposable repository before using it for important work.
-10. The plan is Markdown, not a schema-validated task graph. Cited reference paths are validated. Proposed new files in the target repository are not required to exist yet.
+10. `plan.json` is a structural contract, not evidence that the plan is true or good. `caw` checks the schema version, required fields, identifiers, acceptance-criterion links, argv command shape, and cited reference files. It does not check that a "verified" observation was read, that a suggested command passes, or that the design is sound. Suggested verification commands are not run and do not change `.code-agent-workflow.json`. Older runs with no `planFormat` stay Markdown-only. Reviewer output is still unvalidated Markdown.
 
 ## Testing
 
@@ -198,7 +248,7 @@ Codex receives `--ignore-user-config`. Authentication still uses `CODEX_HOME`, a
 npm test
 ```
 
-The tests cover specification validation, provider permission arguments, local MCP preflight checks, subprocess environment isolation, binary overrides, the approval gate, worktree isolation, verification, review, reference-file checks, and rejection of a reference repository that changes during planning. `npm test` does not invoke Codex or Claude. MCP coverage is three separate kinds of evidence. Argument tests record the command this process builds. They do not prove that an installed binary honored the MCP flags. Local preflight tests reject project and host configuration this process can inspect, and they refuse the run when Git discovery or a configuration read fails. Real-provider checks live in `tests/mcp-provider-probe.test.ts` and stay skipped until you opt in. On a disposable machine with no Codex login, keyring entry, or managed policy, run:
+The tests cover specification validation, structured plan validation, provider permission arguments, local MCP preflight checks, subprocess environment isolation, binary overrides, the approval gate, worktree isolation, verification, review, reference-file checks, legacy Markdown runs, and rejection of a reference repository that changes during planning. `npm test` does not invoke Codex or Claude. MCP coverage is three separate kinds of evidence. Argument tests record the command this process builds. They do not prove that an installed binary honored the MCP flags. Local preflight tests reject project and host configuration this process can inspect, and they refuse the run when Git discovery or a configuration read fails. Real-provider checks live in `tests/mcp-provider-probe.test.ts` and stay skipped until you opt in. On a disposable machine with no Codex login, keyring entry, or managed policy, run:
 
 ```bash
 CAW_MCP_PROVIDER_PROBE=1 npm test

@@ -1,5 +1,5 @@
 export type Provider = "codex" | "claude";
-export type Stage = "planned" | "approved" | "executed" | "execution_failed" | "verified" | "verification_failed" | "reviewed" | "review_failed";
+export type Stage = "planning_failed" | "planned" | "approved" | "executed" | "execution_failed" | "verified" | "verification_failed" | "reviewed" | "review_failed";
 
 export interface Config {
   schemaVersion: 1;
@@ -38,7 +38,11 @@ export interface Run {
   worktree?: string;
   createdAt: string;
   approvedAt?: string;
+  planFormat?: "structured";
+  planJsonHash?: string;
+  planMarkdownHash?: string;
   approvedPlanHash?: string;
+  approvedPlanJsonHash?: string;
   approvedConfigHash?: string;
   verifiedWorktreeHash?: string;
   executedAt?: string;

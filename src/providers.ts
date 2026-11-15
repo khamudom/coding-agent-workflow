@@ -14,16 +14,26 @@ export interface AgentResult {
   durationMs: number;
 }
 
+export interface StructuredPlanRequest {
+  schemaPath: string;
+  schema: Record<string, unknown>;
+  lastMessagePath: string;
+}
+
 export function commandFor(
   provider: Provider,
   mode: Mode,
   prompt: string,
   readDirectories: string[] = [],
+  structured?: StructuredPlanRequest,
 ): { bin: string; args: string[] } {
   // Codex treats --add-dir as a writable root. Only the read-only plan and review
   // sandboxes may receive a reference repository; execution must not mount it.
   // --ignore-user-config drops $CODEX_HOME/config.toml. Auth still uses CODEX_HOME.
   const readOnlyAccess = mode === "execute" ? [] : readDirectories;
+  // --json streams intermediate events that can already match the schema.
+  // The plan is only the file written by --output-last-message.
+  const planSchema = mode === "plan" ? structured : undefined;
   if (provider === "codex") {
     return {
       bin: process.env.CAW_CODEX_BIN || "codex",
@@ -34,6 +44,9 @@ export function commandFor(
         "--sandbox",
         mode === "execute" ? "workspace-write" : "read-only",
         ...readOnlyAccess.flatMap(directory => ["--add-dir", directory]),
+        ...(planSchema
+          ? ["--output-schema", planSchema.schemaPath, "--output-last-message", planSchema.lastMessagePath]
+          : []),
         "-",
       ],
     };
@@ -49,7 +62,8 @@ export function commandFor(
       "-p",
       prompt,
       "--output-format",
-      "text",
+      planSchema ? "json" : "text",
+      ...(planSchema ? ["--json-schema", JSON.stringify(planSchema.schema)] : []),
       "--permission-mode",
       mode === "plan" ? "plan" : "dontAsk",
       "--tools",
@@ -166,9 +180,10 @@ export async function invokeAgent(
   logFile: string,
   timeoutMinutes: number,
   readDirectories: string[] = [],
+  structured?: StructuredPlanRequest,
 ): Promise<AgentResult> {
   assertMcpPolicy(provider, cwd);
-  const { bin, args } = commandFor(provider, mode, prompt, readDirectories);
+  const { bin, args } = commandFor(provider, mode, prompt, readDirectories, structured);
   mkdirSync(path.dirname(logFile), { recursive: true });
   console.log(`  ${provider} / ${mode} running in ${cwd}`);
   console.log(`  ${mcpBoundaryReport(provider)}`);
@@ -223,6 +238,75 @@ export async function invokeAgent(
       });
     });
   });
+}
+
+export function extractPlanDocument(provider: Provider, stdout: string, lastMessagePath: string): unknown {
+  if (provider === "codex") return extractCodexPlan(lastMessagePath);
+  return extractClaudePlan(stdout);
+}
+
+function extractCodexPlan(file: string): unknown {
+  let text: string;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch (error) {
+    if (isNotFound(error)) {
+      throw new Error(
+        `Codex did not write a structured plan to ${file}. Structured planning requires --output-last-message. Stdout was not used as the plan. Upgrade the Codex CLI if that option is unavailable.`,
+      );
+    }
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Cannot read the Codex structured plan at ${file} (${detail}).`);
+  }
+  return parseJsonObject(text, "Codex last message");
+}
+
+function extractClaudePlan(stdout: string): unknown {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout.replace(/^\uFEFF/, ""));
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Claude stdout is not a JSON envelope (${detail}). Diagnostics and Markdown were not accepted as a plan. Structured planning requires --output-format json and --json-schema.`,
+    );
+  }
+  if (!isRecord(parsed) || parsed.type !== "result") {
+    throw new Error("Claude stdout is not a result envelope. Expected type \"result\" and a structured_output object. A raw plan was not accepted.");
+  }
+  if (parsed.is_error === true || (typeof parsed.subtype === "string" && parsed.subtype !== "success")) {
+    throw new Error(`Claude structured output failed (${String(parsed.subtype ?? "error")}). The result text was not accepted as a plan.`);
+  }
+  if (!Object.hasOwn(parsed, "structured_output")) {
+    throw new Error("Claude JSON envelope is missing structured_output. The result field was not accepted as a plan.");
+  }
+  if (!isRecord(parsed.structured_output)) {
+    throw new Error("Claude structured_output must be a JSON object. Strings and other values were not accepted as a plan.");
+  }
+  return parsed.structured_output;
+}
+
+function parseJsonObject(text: string, source: string): unknown {
+  const trimmed = text.replace(/^\uFEFF/, "").trim();
+  if (!trimmed) {
+    throw new Error(`${source} is empty. Structured planning did not receive a JSON object. Stdout and diagnostics were not used as the plan.`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`${source} is not valid JSON (${detail}). Markdown and prose were not accepted as a structured plan.`);
+  }
+  if (!isRecord(parsed)) {
+    const kind = parsed === null ? "null" : Array.isArray(parsed) ? "an array" : `a ${typeof parsed}`;
+    throw new Error(`${source} must be a JSON object. ${kind} was not accepted as a structured plan.`);
+  }
+  return parsed;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function codexConfigFiles(locations: McpPolicyLocations | undefined): readonly string[] {

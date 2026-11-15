@@ -3,9 +3,10 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, realpathSync } from
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { appendIgnore, assertClean, CONFIG_NAME, git, hashText, listRunIds, loadConfig, loadRun, newId, record, repoRoot, runDir, saveRun, worktreeHash } from "./paths.js";
-import { hasBinary, invokeAgent } from "./providers.js";
+import { canonicalPlanJson, PLAN_JSON_SCHEMA, PlanValidationError, renderPlan, validatePlan } from "./plan.js";
+import { extractPlanDocument, hasBinary, invokeAgent, type StructuredPlanRequest } from "./providers.js";
 import { executePrompt, planPrompt, reviewPrompt } from "./prompts.js";
-import { assertReferenceFilesUnchanged, assertReferenceStable, captureReferenceFiles, referenceEvidence, referenceFingerprint, resolveReference, specFromPrompt } from "./references.js";
+import { assertReferenceFilesUnchanged, assertReferenceStable, referenceEvidence, referenceFingerprint, resolveReference, specFromPrompt } from "./references.js";
 import { validateSpecification } from "./spec.js";
 import { childProcessEnvironment } from "./environment.js";
 import type { CheckResult, Config, Provider, ReferenceRepo, Run } from "./types.js";
@@ -78,6 +79,86 @@ function requireWorktree(run: Run): string {
   if (!run.worktree || !existsSync(run.worktree)) throw new Error("Worktree not found; inspect the run state and Git worktree list");
   return run.worktree;
 }
+function failPlanning(run: Run, error: unknown): void {
+  run.stage = "planning_failed";
+  record(run, "planning_failed", error instanceof Error ? error.message : String(error));
+}
+function planFormatOf(run: Run): "structured" | "legacy" {
+  const format = (run as {planFormat?: unknown}).planFormat;
+  if (format === undefined || format === null) return "legacy";
+  if (format === "structured") return "structured";
+  throw new Error(`Unsupported plan format: ${String(format)}. This harness accepts structured plans and older Markdown-only runs.`);
+}
+function unchangedStructuredPlan(run: Run): {json: string; markdown: string} {
+  const jsonPath = targetFile(run, "plan.json");
+  const markdownPath = targetFile(run, "plan.md");
+  if (!existsSync(jsonPath)) throw new Error("Structured plan is missing plan.json");
+  if (!existsSync(markdownPath)) throw new Error("Structured plan is missing plan.md");
+  if (!run.planJsonHash || !run.planMarkdownHash) throw new Error("Structured plan is missing the snapshot recorded at planning. Start a new run.");
+  const json = content(jsonPath);
+  const markdown = content(markdownPath);
+  if (hashText(json) !== run.planJsonHash) throw new Error("plan.json changed since planning. Start a new run.");
+  if (hashText(markdown) !== run.planMarkdownHash) throw new Error("plan.md changed since planning. Start a new run.");
+  assertStructuredDocuments(run, json, markdown);
+  return {json, markdown};
+}
+function assertStructuredDocuments(run: Run, json: string, markdown: string): void {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`plan.json is not valid JSON (${detail}). Start a new run.`);
+  }
+  const listed = referenceEntries(parsed);
+  const captured = run.referenceFiles ?? [];
+  const matches = listed.length === captured.length && listed.every((item, index) => {
+    const file = captured[index];
+    return file !== undefined && file.repository === item.repository && file.path === item.path;
+  });
+  if (!matches) throw new Error("plan.json reference files do not match the evidence captured during planning. Start a new run.");
+  let validated;
+  try {
+    validated = validatePlan(parsed, run.references ?? []);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Structured plan is not valid. Start a new run.\n${detail}`);
+  }
+  if (renderPlan(validated.plan) !== markdown) throw new Error("plan.md does not match plan.json. Start a new run.");
+}
+function referenceEntries(parsed: unknown): Array<{repository: string; path: string}> {
+  if (!isPlanRecord(parsed) || !Array.isArray(parsed.referenceFiles)) {
+    throw new Error("plan.json reference files do not match the evidence captured during planning. Start a new run.");
+  }
+  return parsed.referenceFiles.map(item => {
+    if (!isPlanRecord(item) || typeof item.repository !== "string" || typeof item.path !== "string") {
+      throw new Error("plan.json reference files do not match the evidence captured during planning. Start a new run.");
+    }
+    return {repository: item.repository, path: item.path};
+  });
+}
+function isPlanRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function readApprovedPlan(run: Run): string {
+  const markdownPath = targetFile(run, "plan.md");
+  if (!existsSync(markdownPath)) throw new Error("Approved plan.md is missing; start a new run");
+  const markdown = content(markdownPath);
+  if (hashText(markdown) !== run.approvedPlanHash) throw new Error("Approved plan changed since approval; start a new run");
+  if (planFormatOf(run) === "structured") {
+    const jsonPath = targetFile(run, "plan.json");
+    if (!existsSync(jsonPath)) throw new Error("Approved plan.json is missing; start a new run");
+    const json = content(jsonPath);
+    if (!run.planJsonHash || !run.planMarkdownHash) throw new Error("Structured plan is missing the snapshot recorded at planning. Start a new run.");
+    if (!run.approvedPlanJsonHash) throw new Error("Structured plan is missing its approved plan.json hash; start a new run");
+    if (hashText(json) !== run.approvedPlanJsonHash) throw new Error("Approved plan.json changed since approval; start a new run");
+    if (run.approvedPlanJsonHash !== run.planJsonHash || run.approvedPlanHash !== run.planMarkdownHash) {
+      throw new Error("Approved plan does not match the snapshot recorded at planning. Start a new run.");
+    }
+    assertStructuredDocuments(run, json, markdown);
+  }
+  return markdown;
+}
 
 function init(repo: string): void {
   const configFile = path.join(repo, CONFIG_NAME);
@@ -109,6 +190,7 @@ async function doctor(repo: string): Promise<void> {
   console.log(`Claude CLI: ${hasBinary(process.env.CAW_CLAUDE_BIN || "claude") ? "found" : "not found"}`);
   console.log(`Default: ${config.defaultProvider}; verify commands: ${config.verify.length}`);
   if (config.verify.length === 0) console.log("WARNING: Configure nonempty verify commands to make the verification gate meaningful.");
+  console.log("Plans: new runs write schema version 1 to plan.json and generate plan.md. Older runs that only have plan.md still approve and execute.");
   console.log("Safety: only use trusted repositories; a Git worktree isolates changes, not shell processes or secrets.");
   console.log("MCP: Claude requests --strict-mcp-config and denies mcp__*. Codex requests --ignore-user-config and refuses readable project or host MCP configuration. A passing local check does not cover cloud-managed Codex configuration, macOS managed preferences, or remote Claude managed MCP settings.");
 }
@@ -156,33 +238,56 @@ async function plan(repo: string, args: string[]): Promise<void> {
   const branch = `caw/${id}`;
   const run: Run = {
     schemaVersion: 1, id, specSource, specHash: hashText(spec), references,
-    provider, stage: "planned", repoRoot: repo, baseCommit: git(repo, ["rev-parse", "HEAD"]), branch,
+    provider, stage: "planned", planFormat: "structured", repoRoot: repo, baseCommit: git(repo, ["rev-parse", "HEAD"]), branch,
     createdAt: new Date().toISOString(), eventLog: []
   };
   saveRun(run);
   writeLocal(targetFile(run, "spec.md"), spec);
+  const schemaPath = targetFile(run, "plan.schema.json");
+  const lastMessagePath = targetFile(run, "plan-last-message.json");
+  const logFile = targetFile(run, "plan-agent.log");
+  writeLocal(schemaPath, `${JSON.stringify(PLAN_JSON_SCHEMA, null, 2)}\n`);
   record(run, "planning_started", `provider=${provider}; references=${references.map(reference => reference.path).join(",") || "none"}`);
-  if (!hasBinary(process.env[provider === "codex" ? "CAW_CODEX_BIN" : "CAW_CLAUDE_BIN"] || provider)) throw new Error(`Missing ${provider} CLI. Check caw doctor and install/login first.`);
+  const structured: StructuredPlanRequest = {schemaPath, schema: PLAN_JSON_SCHEMA, lastMessagePath};
+  if (!hasBinary(process.env[provider === "codex" ? "CAW_CODEX_BIN" : "CAW_CLAUDE_BIN"] || provider)) {
+    const message = `Missing ${provider} CLI. Check caw doctor and install/login first.`;
+    failPlanning(run, message);
+    throw new Error(message);
+  }
   let result;
   try {
-    result = await withStableReferences(references, () => invokeAgent(provider, "plan", planPrompt(spec, references), repo, targetFile(run, "plan-agent.log"), config.executionTimeoutMinutes, references.map(reference => reference.path)));
+    result = await withStableReferences(references, () => invokeAgent(provider, "plan", planPrompt(spec, references), repo, logFile, config.executionTimeoutMinutes, references.map(reference => reference.path), structured));
   } catch (error) {
-    record(run, "planning_failed", error instanceof Error ? error.message : String(error));
+    failPlanning(run, error);
     throw error;
   }
-  if (result.exitCode !== 0 || !result.stdout.trim()) {
-    record(run, "planning_failed", `exit=${result.exitCode}`);
-    throw new Error(`Planning agent failed (exit ${result.exitCode}); see ${targetFile(run, "plan-agent.log")}`);
+  if (result.exitCode !== 0) {
+    const message = `Planning agent failed (exit ${result.exitCode}); see ${logFile}. Structured planning requires Codex --output-schema and --output-last-message, or Claude --output-format json and --json-schema. Provider diagnostics were not accepted as a plan.`;
+    failPlanning(run, message);
+    throw new Error(message);
   }
   try {
-    run.referenceFiles = captureReferenceFiles(result.stdout, references);
+    const document = extractPlanDocument(provider, result.stdout, lastMessagePath);
+    const validated = validatePlan(document, references);
+    const json = canonicalPlanJson(validated.plan);
+    const markdown = renderPlan(validated.plan);
+    run.referenceFiles = validated.referenceFiles;
+    run.planJsonHash = hashText(json);
+    run.planMarkdownHash = hashText(markdown);
+    writeLocal(targetFile(run, "plan.json"), json);
+    writeLocal(targetFile(run, "plan.md"), markdown);
   } catch (error) {
-    record(run, "planning_failed", error instanceof Error ? error.message : String(error));
-    throw error;
+    const detail = error instanceof PlanValidationError
+      ? `Planning output is not a valid structured plan:\n${error.message}`
+      : error instanceof Error ? error.message : String(error);
+    const message = `${detail}\nSee ${logFile}.`;
+    failPlanning(run, message);
+    throw new Error(message);
   }
-  writeLocal(targetFile(run, "plan.md"), result.stdout);
-  record(run, "plan_ready", `${run.referenceFiles.length} reference file${run.referenceFiles.length === 1 ? "" : "s"}`);
-  console.log(`\nPlan ready: ${targetFile(run, "plan.md")}\nRun ID: ${id}`);
+  record(run, "plan_ready", `${run.referenceFiles?.length ?? 0} reference file${run.referenceFiles?.length === 1 ? "" : "s"}`);
+  console.log(`\nPlan ready: ${targetFile(run, "plan.md")}`);
+  console.log(`Structured plan: ${targetFile(run, "plan.json")}`);
+  console.log(`Run ID: ${id}`);
   for (const reference of references) console.log(`Reference: ${reference.path} @ ${reference.commit}`);
   console.log(`Review plan, then: caw approve ${id}`);
 }
@@ -190,12 +295,19 @@ async function plan(repo: string, args: string[]): Promise<void> {
 function approve(repo: string, id: string): void {
   const run = loadRun(repo, id);
   needStage(run, "planned");
-  if (!existsSync(targetFile(run, "plan.md"))) throw new Error("No completed plan to approve");
+  const format = planFormatOf(run);
+  if (format === "legacy" && !existsSync(targetFile(run, "plan.md"))) throw new Error("No completed plan to approve");
   if (hashText(content(targetFile(run, "spec.md"))) !== run.specHash) throw new Error("Specification snapshot modified since planning");
   if (git(repo, ["rev-parse", "HEAD"]) !== run.baseCommit) throw new Error("Repository HEAD changed since planning; replan for fresh base");
   assertReferenceFilesUnchanged(run.referenceFiles ?? []);
   assertClean(repo);
-  run.approvedPlanHash = hashText(content(targetFile(run, "plan.md")));
+  if (format === "structured") {
+    const plan = unchangedStructuredPlan(run);
+    run.approvedPlanHash = hashText(plan.markdown);
+    run.approvedPlanJsonHash = hashText(plan.json);
+  } else {
+    run.approvedPlanHash = hashText(content(targetFile(run, "plan.md")));
+  }
   run.approvedConfigHash = hashText(content(path.join(repo, CONFIG_NAME)));
   run.stage = "approved";
   run.approvedAt = new Date().toISOString();
@@ -208,7 +320,7 @@ async function implement(repo: string, id: string): Promise<void> {
   const run = loadRun(repo, id);
   needStage(run, "approved");
   if (git(repo, ["rev-parse", "HEAD"]) !== run.baseCommit) throw new Error("HEAD changed since approval; replan for fresh base");
-  if (hashText(content(targetFile(run, "plan.md"))) !== run.approvedPlanHash) throw new Error("Approved plan changed since approval; start a new run");
+  const approvedPlan = readApprovedPlan(run);
   if (hashText(content(targetFile(run, "spec.md"))) !== run.specHash) throw new Error("Specification changed since approval; start a new run");
   assertClean(repo);
   if (hashText(content(path.join(repo, CONFIG_NAME))) !== run.approvedConfigHash) throw new Error("Project configuration changed since approval; start a new run");
@@ -222,7 +334,6 @@ async function implement(repo: string, id: string): Promise<void> {
   run.worktree = worktree;
   record(run, "worktree_created", worktree);
   const spec = content(targetFile(run, "spec.md"));
-  const approvedPlan = content(targetFile(run, "plan.md"));
   let result;
   try {
     result = await withStableReferences(run.references ?? [], () => invokeAgent(run.provider, "execute", executePrompt(spec, approvedPlan, evidence), worktree, targetFile(run, "execution-agent.log"), config.executionTimeoutMinutes));
@@ -307,7 +418,7 @@ async function review(repo: string, id: string, args: string[]): Promise<void> {
   const untracked = git(worktree, ["ls-files", "--others", "--exclude-standard"]);
   const references = run.references ?? [];
   assertReferenceFilesUnchanged(run.referenceFiles ?? []);
-  const prompt = reviewPrompt(content(targetFile(run, "spec.md")), content(targetFile(run, "plan.md")), references) +
+  const prompt = reviewPrompt(content(targetFile(run, "spec.md")), readApprovedPlan(run), references) +
     `\nBase commit for diff: ${run.baseCommit}\n` +
     `\n<git-diff truncated="${diff.length > 120000}">\n${diff.slice(0, 120000)}\n</git-diff>` +
     `\n<untracked-files>\n${untracked}\n</untracked-files>\n` +
@@ -336,13 +447,13 @@ function report(repo: string, id: string): void {
   const reportText = `# Code Agent Workflow Evidence Report\n\n` +
     `- Run: ${run.id}\n- Stage: ${run.stage}\n- Spec source: ${run.specSource}\n- Spec SHA256: ${run.specHash}\n` +
     `- Base commit: ${run.baseCommit}\n- Provider: ${run.provider}\n- Review provider: ${run.reviewProvider || "not run"}\n` +
-    `- Human approval recorded: ${run.approvedAt || "NO"}\n- Approved configuration SHA256: ${run.approvedConfigHash || "not approved"}\n- Approved plan SHA256: ${run.approvedPlanHash || "not approved"}\n- Verified worktree SHA256: ${run.verifiedWorktreeHash || "not verified"}\n- Branch: ${run.branch}\n- Worktree: ${run.worktree || "not created"}\n\n` +
+    `- Plan format: ${run.planFormat ?? "markdown (legacy)"}\n- Human approval recorded: ${run.approvedAt || "NO"}\n- Approved configuration SHA256: ${run.approvedConfigHash || "not approved"}\n- Approved plan SHA256: ${run.approvedPlanHash || "not approved"}\n- Approved plan.json SHA256: ${run.planFormat === "structured" ? (run.approvedPlanJsonHash || "not approved") : "not used"}\n- Verified worktree SHA256: ${run.verifiedWorktreeHash || "not verified"}\n- Branch: ${run.branch}\n- Worktree: ${run.worktree || "not created"}\n\n` +
     `## Reference repositories\n` + (run.references?.length ? run.references.map(reference => `- ${reference.path} @ ${reference.commit}${reference.dirty ? " (dirty at planning)" : ""}`).join("\n") : "- None") +
     `\n\n## Reference files\n` + (run.referenceFiles?.length ? run.referenceFiles.map(file => `- \`${file.path}\` \`${file.sha256}\``).join("\n") : "- None") + "\n\n" +
     `## Verification\n` + (run.checkResults?.length ? run.checkResults.map(c => `- \`${c.command.join(" ")}\`: ${c.exitCode === 0 ? "PASS" : "FAIL"} (${c.durationMs} ms)`).join("\n") : "No verification recorded") +
     `\n\n## Change status\n\n\`\`\`\n${status || "(clean)"}\n\`\`\`\n\n## Diff summary (tracked files)\n\n\`\`\`\n${changed || "(none)"}\n\`\`\`\n\n` +
     `## Events\n` + run.eventLog.map(e => `- ${e.at}: ${e.event}${e.note ? ` — ${e.note}` : ""}`).join("\n") +
-    `\n\n## Artifacts\n\n- spec.md, plan.md, execution-agent.log, review.md (if available), verify-*.log\n` +
+    `\n\n## Artifacts\n\n- spec.md, plan.json (structured runs), plan.md, execution-agent.log, review.md (if available), verify-*.log\n` +
     `\n**Advisory only:** A passing check and an LLM reviewer do not replace human review, security inspection, and normal CI. No merge, push, deployment, or PR was performed by this tool.\n`;
   const file = targetFile(run, "REPORT.md");
   writeLocal(file, reportText);
