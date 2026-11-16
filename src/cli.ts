@@ -1,11 +1,12 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { appendIgnore, assertClean, CONFIG_NAME, git, hashText, listRunIds, loadConfig, loadRun, newId, record, repoRoot, runDir, saveRun, worktreeHash } from "./paths.js";
 import { canonicalPlanJson, PLAN_JSON_SCHEMA, PlanValidationError, renderPlan, validatePlan } from "./plan.js";
-import { extractPlanDocument, hasBinary, invokeAgent, type StructuredPlanRequest } from "./providers.js";
-import { executePrompt, planPrompt, reviewPrompt } from "./prompts.js";
+import { extractPlanDocument, extractReviewDocument, hasBinary, invokeAgent, type StructuredOutputRequest } from "./providers.js";
+import { canonicalReviewJson, CRITERION_STATUSES, FINDING_SEVERITIES, renderReview, REVIEW_JSON_SCHEMA, REVIEW_VERDICTS, reviewDiffPrompt, reviewLocation, ReviewValidationError, validateReview, type CodeReview, type ReviewEvidence, type ReviewVerdict } from "./review.js";
+import { executePrompt, planPrompt, reviewPrompt, verificationEvidencePrompt } from "./prompts.js";
 import { assertReferenceFilesUnchanged, assertReferenceStable, referenceEvidence, referenceFingerprint, resolveReference, specFromPrompt } from "./references.js";
 import { validateSpecification } from "./spec.js";
 import { childProcessEnvironment } from "./environment.js";
@@ -82,6 +83,124 @@ function requireWorktree(run: Run): string {
 function failPlanning(run: Run, error: unknown): void {
   run.stage = "planning_failed";
   record(run, "planning_failed", error instanceof Error ? error.message : String(error));
+}
+interface DeliveredReview {
+  kind: "structured" | "legacy";
+  reviewProvider?: Provider;
+  reviewedAt?: string;
+  reviewJsonHash?: string;
+  reviewMarkdownHash?: string;
+  reviewDiffTruncated?: boolean;
+  reviewDiffSha256?: string;
+  reviewUntrackedTruncated?: boolean;
+}
+function deliveredReview(run: Run): DeliveredReview | undefined {
+  if (run.stage !== "reviewed") return undefined;
+  const markdownPath = targetFile(run, "review.md");
+  const jsonPath = targetFile(run, "review.json");
+  if (run.reviewFormat === "structured" && run.reviewJsonHash && run.reviewMarkdownHash && existsSync(jsonPath) && existsSync(markdownPath)) {
+    return {
+      kind: "structured",
+      reviewProvider: run.reviewProvider,
+      reviewedAt: run.reviewedAt,
+      reviewJsonHash: run.reviewJsonHash,
+      reviewMarkdownHash: run.reviewMarkdownHash,
+      reviewDiffTruncated: run.reviewDiffTruncated,
+      reviewDiffSha256: run.reviewDiffSha256,
+      reviewUntrackedTruncated: run.reviewUntrackedTruncated,
+    };
+  }
+  if (run.reviewFormat === undefined && existsSync(markdownPath) && !existsSync(jsonPath)) {
+    return {kind: "legacy", reviewProvider: run.reviewProvider, reviewedAt: run.reviewedAt};
+  }
+  return undefined;
+}
+function restoreDeliveredMetadata(run: Run, delivered: DeliveredReview): void {
+  run.stage = "reviewed";
+  if (delivered.reviewProvider === undefined) delete run.reviewProvider;
+  else run.reviewProvider = delivered.reviewProvider;
+  if (delivered.reviewedAt === undefined) delete run.reviewedAt;
+  else run.reviewedAt = delivered.reviewedAt;
+  if (delivered.kind === "legacy") {
+    delete run.reviewFormat;
+    delete run.reviewJsonHash;
+    delete run.reviewMarkdownHash;
+    delete run.reviewDiffTruncated;
+    delete run.reviewDiffSha256;
+    delete run.reviewUntrackedTruncated;
+    return;
+  }
+  run.reviewFormat = "structured";
+  run.reviewJsonHash = delivered.reviewJsonHash;
+  run.reviewMarkdownHash = delivered.reviewMarkdownHash;
+  if (delivered.reviewDiffTruncated === undefined) delete run.reviewDiffTruncated;
+  else run.reviewDiffTruncated = delivered.reviewDiffTruncated;
+  if (delivered.reviewDiffSha256 === undefined) delete run.reviewDiffSha256;
+  else run.reviewDiffSha256 = delivered.reviewDiffSha256;
+  if (delivered.reviewUntrackedTruncated === undefined) delete run.reviewUntrackedTruncated;
+  else run.reviewUntrackedTruncated = delivered.reviewUntrackedTruncated;
+}
+function discardReviewAttempt(run: Run): void {
+  for (const name of ["review.json.next", "review.md.next"]) {
+    const file = targetFile(run, name);
+    if (existsSync(file)) unlinkSync(file);
+  }
+}
+function failReview(run: Run, error: unknown, delivered?: DeliveredReview): Error {
+  discardReviewAttempt(run);
+  const note = error instanceof Error ? error.message : String(error);
+  if (delivered) {
+    restoreDeliveredMetadata(run, delivered);
+    const kept = `${note} The previously delivered review was left unchanged.`;
+    record(run, "review_failed", kept);
+    return new Error(kept);
+  }
+  for (const name of ["review.json", "review.md"]) {
+    const file = targetFile(run, name);
+    if (existsSync(file)) unlinkSync(file);
+  }
+  delete run.reviewFormat;
+  delete run.reviewJsonHash;
+  delete run.reviewMarkdownHash;
+  delete run.reviewDiffTruncated;
+  delete run.reviewDiffSha256;
+  delete run.reviewUntrackedTruncated;
+  delete run.reviewedAt;
+  run.stage = "review_failed";
+  record(run, "review_failed", note);
+  return new Error(note);
+}
+function publishReviewArtifacts(run: Run, json: string, markdown: string): void {
+  const jsonPath = targetFile(run, "review.json");
+  const markdownPath = targetFile(run, "review.md");
+  const jsonNext = `${jsonPath}.next`;
+  const markdownNext = `${markdownPath}.next`;
+  writeLocal(jsonNext, json);
+  writeLocal(markdownNext, markdown);
+  const previousJson = existsSync(jsonPath) ? readFileSync(jsonPath) : undefined;
+  const previousMarkdown = existsSync(markdownPath) ? readFileSync(markdownPath) : undefined;
+  const restore = (filename: string, previous: Buffer | undefined) => {
+    if (previous === undefined) {
+      if (existsSync(filename)) unlinkSync(filename);
+      return;
+    }
+    writeFileSync(filename, previous, {mode: 0o600});
+  };
+  try {
+    renameSync(jsonNext, jsonPath);
+    renameSync(markdownNext, markdownPath);
+  } catch (error) {
+    restore(jsonPath, previousJson);
+    restore(markdownPath, previousMarkdown);
+    discardReviewAttempt(run);
+    throw error;
+  }
+}
+function expectedCriterionIds(run: Run): string[] {
+  readApprovedPlan(run);
+  if (planFormatOf(run) === "legacy") return [];
+  const parsed = JSON.parse(content(targetFile(run, "plan.json"))) as unknown;
+  return validatePlan(parsed, run.references ?? []).plan.acceptanceCriteria.map(criterion => criterion.id);
 }
 function planFormatOf(run: Run): "structured" | "legacy" {
   const format = (run as {planFormat?: unknown}).planFormat;
@@ -191,6 +310,7 @@ async function doctor(repo: string): Promise<void> {
   console.log(`Default: ${config.defaultProvider}; verify commands: ${config.verify.length}`);
   if (config.verify.length === 0) console.log("WARNING: Configure nonempty verify commands to make the verification gate meaningful.");
   console.log("Plans: new runs write schema version 1 to plan.json and generate plan.md. Older runs that only have plan.md still approve and execute.");
+  console.log("Reviews: new reviews write schema version 1 to review.json and generate review.md. The verdict is advisory. Older runs that only have review.md stay readable and are not treated as a validated verdict.");
   console.log("Safety: only use trusted repositories; a Git worktree isolates changes, not shell processes or secrets.");
   console.log("MCP: Claude requests --strict-mcp-config and denies mcp__*. Codex requests --ignore-user-config and refuses readable project or host MCP configuration. A passing local check does not cover cloud-managed Codex configuration, macOS managed preferences, or remote Claude managed MCP settings.");
 }
@@ -248,7 +368,7 @@ async function plan(repo: string, args: string[]): Promise<void> {
   const logFile = targetFile(run, "plan-agent.log");
   writeLocal(schemaPath, `${JSON.stringify(PLAN_JSON_SCHEMA, null, 2)}\n`);
   record(run, "planning_started", `provider=${provider}; references=${references.map(reference => reference.path).join(",") || "none"}`);
-  const structured: StructuredPlanRequest = {schemaPath, schema: PLAN_JSON_SCHEMA, lastMessagePath};
+  const structured: StructuredOutputRequest = {schemaPath, schema: PLAN_JSON_SCHEMA, lastMessagePath};
   if (!hasBinary(process.env[provider === "codex" ? "CAW_CODEX_BIN" : "CAW_CLAUDE_BIN"] || provider)) {
     const message = `Missing ${provider} CLI. Check caw doctor and install/login first.`;
     failPlanning(run, message);
@@ -413,30 +533,289 @@ async function review(repo: string, id: string, args: string[]): Promise<void> {
   const provider = requireProvider(option(args, "--provider"), run.provider);
   if (hashText(content(path.join(repo, CONFIG_NAME))) !== run.approvedConfigHash) throw new Error("Configuration drifted since approval");
   if (!run.verifiedWorktreeHash || run.verifiedWorktreeHash !== worktreeHash(worktree, run.baseCommit)) throw new Error("Code changed after verification. Run caw verify again before review.");
+  const verification = verificationEvidence(run, cfg);
   // Independent model session, not the implementer's conversation.
   const diff = git(worktree, ["diff", "--no-ext-diff", run.baseCommit]);
   const untracked = git(worktree, ["ls-files", "--others", "--exclude-standard"]);
   const references = run.references ?? [];
   assertReferenceFilesUnchanged(run.referenceFiles ?? []);
-  const prompt = reviewPrompt(content(targetFile(run, "spec.md")), readApprovedPlan(run), references) +
+  const approvedPlan = readApprovedPlan(run);
+  const criterionIds = expectedCriterionIds(run);
+  const diffEvidence = reviewDiffPrompt(diff, run.baseCommit, untracked);
+  const prompt = reviewPrompt(content(targetFile(run, "spec.md")), approvedPlan, references, planFormatOf(run) === "legacy" ? undefined : criterionIds) +
     `\nBase commit for diff: ${run.baseCommit}\n` +
-    `\n<git-diff truncated="${diff.length > 120000}">\n${diff.slice(0, 120000)}\n</git-diff>` +
-    `\n<untracked-files>\n${untracked}\n</untracked-files>\n` +
-    `\nUse file read tools to inspect any untracked source files and understand context.`;
+    verification +
+    diffEvidence.text;
   if (!hasBinary(process.env[provider === "codex" ? "CAW_CODEX_BIN" : "CAW_CLAUDE_BIN"] || provider)) throw new Error(`Missing ${provider} CLI. Check caw doctor.`);
-  const result = await withStableReferences(references, () => invokeAgent(provider, "review", prompt, worktree, targetFile(run, "review-agent.log"), cfg.executionTimeoutMinutes, references.map(reference => reference.path)));
+  const delivered = deliveredReview(run);
+  const schemaPath = targetFile(run, "review.schema.json");
+  const lastMessagePath = targetFile(run, "review-last-message.json");
+  const logFile = targetFile(run, "review-agent.log");
+  writeLocal(schemaPath, `${JSON.stringify(REVIEW_JSON_SCHEMA, null, 2)}\n`);
+  if (existsSync(lastMessagePath)) unlinkSync(lastMessagePath);
+  const structured: StructuredOutputRequest = {schemaPath, schema: REVIEW_JSON_SCHEMA, lastMessagePath};
   run.reviewProvider = provider;
-  if (result.exitCode !== 0 || !result.stdout.trim()) {
-    run.stage = "review_failed";
-    record(run, "review_failed", `exit=${result.exitCode}`);
-    throw new Error("Review agent failed; see review-agent.log");
+  let result;
+  try {
+    result = await withStableReferences(references, () => invokeAgent(provider, "review", prompt, worktree, logFile, cfg.executionTimeoutMinutes, references.map(reference => reference.path), structured));
+  } catch (error) {
+    throw failReview(run, error, delivered);
   }
-  writeLocal(targetFile(run, "review.md"), result.stdout);
-  run.reviewedAt = new Date().toISOString();
-  run.stage = "reviewed";
-  record(run, "review_delivered", `provider=${provider}; advisory review, not automatic approval`);
-  console.log(`Independent review saved: ${targetFile(run, "review.md")}`);
-  console.log(`Next: caw report ${id}. A human must assess findings before any merge.`);
+  if (result.exitCode !== 0) {
+    const message = `Review agent failed (exit ${result.exitCode}); see ${logFile}. Structured review requires Codex --output-schema and --output-last-message, or Claude --output-format json and --json-schema. Provider diagnostics were not accepted as a review.`;
+    throw failReview(run, message, delivered);
+  }
+  try {
+    const document = extractReviewDocument(provider, result.stdout, lastMessagePath);
+    const evidence: ReviewEvidence = {
+      truncatedDiff: diffEvidence.diffTruncated,
+      truncatedUntracked: diffEvidence.untrackedTruncated,
+    };
+    const validated = validateReview(document, criterionIds, evidence);
+    const json = canonicalReviewJson(validated);
+    const markdown = renderReview(validated);
+    publishReviewArtifacts(run, json, markdown);
+    run.reviewFormat = "structured";
+    run.reviewJsonHash = hashText(json);
+    run.reviewMarkdownHash = hashText(markdown);
+    if (diffEvidence.diffTruncated) {
+      run.reviewDiffTruncated = true;
+      run.reviewDiffSha256 = diffEvidence.diffSha256;
+    } else {
+      delete run.reviewDiffTruncated;
+      delete run.reviewDiffSha256;
+    }
+    if (diffEvidence.untrackedTruncated) run.reviewUntrackedTruncated = true;
+    else delete run.reviewUntrackedTruncated;
+    run.reviewedAt = new Date().toISOString();
+    run.stage = "reviewed";
+    record(run, "review_delivered", `provider=${provider}; verdict=${validated.verdict}; advisory review, not automatic approval`);
+    console.log(`Independent review saved: ${targetFile(run, "review.md")}`);
+    console.log(`Structured review: ${targetFile(run, "review.json")}`);
+    console.log(`Verdict: ${validated.verdict} (advisory; not a merge approval)`);
+    console.log(`Next: caw report ${id}. A human must assess findings before any merge.`);
+  } catch (error) {
+    const detail = error instanceof ReviewValidationError
+      ? `Review output is not a valid structured review:\n${error.message}`
+      : error instanceof Error ? error.message : String(error);
+    const message = `${detail}\nSee ${logFile}.`;
+    throw failReview(run, message, delivered);
+  }
+}
+
+function confirmedVerification(run: Run, approved: readonly string[][]): {command: string[]; exitCode: number; durationMs: number; log: string}[] {
+  const checks = run.checkResults;
+  if (!run.verifiedAt || !checks || checks.length === 0 || approved.length === 0) {
+    throw new Error("Verification evidence is missing for this approved run. caw will not describe it as passing.");
+  }
+  if (checks.length !== approved.length) {
+    throw new Error("Verification evidence does not match the approved commands. caw will not describe it as passing.");
+  }
+  const rows: {command: string[]; exitCode: number; durationMs: number; log: string}[] = [];
+  for (let i = 0; i < approved.length; i++) {
+    const expected = approved[i]!;
+    const check = checks[i];
+    if (!check || !argvMatches(check.command, expected)) {
+      throw new Error("Verification evidence does not match the approved commands. caw will not describe it as passing.");
+    }
+    if (check.exitCode !== 0) {
+      throw new Error("Verification evidence does not show that every approved command passed. caw will not describe it as passing.");
+    }
+    if (typeof check.durationMs !== "number" || !Number.isFinite(check.durationMs) || check.durationMs < 0) {
+      throw new Error("Verification evidence is missing for this approved run. caw will not describe it as passing.");
+    }
+    const log = `verify-${i + 1}.log`;
+    if (check.log !== targetFile(run, log) || !existsSync(check.log)) {
+      throw new Error("Verification log is missing or does not belong to this run. caw will not describe it as passing.");
+    }
+    rows.push({command: expected, exitCode: check.exitCode, durationMs: check.durationMs, log});
+  }
+  return rows;
+}
+function verificationEvidence(run: Run, cfg: Config): string {
+  return verificationEvidencePrompt(confirmedVerification(run, cfg.verify));
+}
+function worktreeSnapshotProblem(run: Run): string | undefined {
+  if (!run.verifiedWorktreeHash) return "No verified worktree snapshot is recorded. caw will not describe verification as passing.";
+  if (!run.worktree || !existsSync(run.worktree)) return "The verified worktree is not available, so the snapshot cannot be confirmed. caw will not describe verification as passing.";
+  try {
+    if (worktreeHash(run.worktree, run.baseCommit) !== run.verifiedWorktreeHash) {
+      return "The worktree no longer matches the verified snapshot. caw will not describe verification as passing.";
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return `The verified worktree snapshot could not be checked. ${detail}`;
+  }
+  return undefined;
+}
+function verificationReport(run: Run, repo: string): {passed: boolean; detail: string; problems: string[]} {
+  const problems: string[] = [];
+  const configPath = path.join(repo, CONFIG_NAME);
+  const configMatches = Boolean(run.approvedConfigHash) && existsSync(configPath) && hashText(content(configPath)) === run.approvedConfigHash;
+  let passed = false;
+  let detail = "No verification recorded";
+  if (!configMatches) {
+    problems.push("Approved configuration no longer matches this run, so the verification commands cannot be confirmed. caw will not describe verification as passing.");
+    detail = problems[0]!;
+  } else {
+    try {
+      const rows = confirmedVerification(run, loadConfig(repo).verify);
+      passed = true;
+      detail = rows.map(check => `- \`${check.command.join(" ")}\`: passed (${check.durationMs} ms)`).join("\n");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      problems.push(message);
+      detail = `${message}\n\nRecorded checks:\n${formatRecordedChecks(run)}`;
+    }
+  }
+  const snapshot = worktreeSnapshotProblem(run);
+  if (snapshot) {
+    passed = false;
+    problems.push(snapshot);
+    detail = `${detail}\n\n${snapshot}`;
+  }
+  return {passed, detail, problems};
+}
+function formatRecordedChecks(run: Run): string {
+  if (!run.checkResults?.length) return "No verification recorded";
+  return run.checkResults.map(check => {
+    const command = Array.isArray(check.command) ? check.command.map(arg => typeof arg === "string" ? arg : "?").join(" ") : "(unreadable command)";
+    const exitCode = typeof check.exitCode === "number" ? String(check.exitCode) : "unreadable";
+    const duration = typeof check.durationMs === "number" ? String(check.durationMs) : "unreadable";
+    return `- \`${command}\`: exit ${exitCode} (${duration} ms)`;
+  }).join("\n");
+}
+function argvMatches(actual: unknown, expected: readonly string[]): boolean {
+  return Array.isArray(actual) && actual.length === expected.length && actual.every((arg, index) => typeof arg === "string" && arg === expected[index]);
+}
+function trackedDiffLine(run: Run): string {
+  if (run.reviewDiffTruncated !== true) return "- Tracked diff: complete in the review prompt";
+  const provenance = run.reviewDiffSha256
+    ? ` Complete-diff SHA-256 ${run.reviewDiffSha256} is diagnostic provenance of the captured diff and does not establish that the omitted changes were inspected.`
+    : "";
+  return `- Tracked diff: truncated in the review prompt.${provenance}`;
+}
+
+function reviewDetails(lines: string[], review: CodeReview, run: Run): void {
+  lines.push(trackedDiffLine(run));
+  if (run.reviewUntrackedTruncated === true) {
+    lines.push("- Untracked files: the prompt listing was truncated. The list does not establish that file contents were inspected.");
+  }
+  lines.push(`- Findings: ${findingCounts(review)}`);
+  lines.push(`- Acceptance criteria: ${coverageCounts(review)}`);
+  lines.push("- Artifacts: review.json, review.md");
+  if (review.findings.length > 0) {
+    lines.push("", "### Finding index");
+    for (const finding of FINDING_SEVERITIES.flatMap(severity => review.findings.filter(item => item.severity === severity))) {
+      const location = reviewLocation(finding);
+      lines.push(`- ${finding.severity} \`${finding.id}\` ${location === "repository-wide" ? location : `\`${location}\``}`);
+    }
+  }
+}
+function reviewSection(run: Run, verificationProblems: readonly string[]): string {
+  const delivery = run.stage === "reviewed" ? "succeeded" : run.stage === "review_failed" ? "failed" : "not run";
+  const lines = [
+    "## Review",
+    "",
+    `- Delivery: ${delivery}`,
+    `- Provider: ${run.reviewProvider || "not run"}`,
+  ];
+  const jsonPath = targetFile(run, "review.json");
+  const markdownPath = targetFile(run, "review.md");
+  const delivered = readDeliveredReview(run);
+  if (run.reviewFormat === "structured" && run.stage === "reviewed") {
+    lines.push("- Format: structured (schema version 1)");
+    const review = delivered.review;
+    const historical = review?.verdict ?? historicalDecision(run);
+    if (review && verificationProblems.length === 0) {
+      lines.push(`- Reviewer verdict: ${review.verdict}`);
+      lines.push("- Current evidence integrity: consistent");
+      reviewDetails(lines, review, run);
+    } else if (historical) {
+      lines.push(`- Historical reviewer decision: ${historical}`);
+      lines.push("- Current evidence integrity: inconsistent");
+      for (const problem of verificationProblems) lines.push(`- ${problem}`);
+      if (delivered.problem) lines.push(`- ${delivered.problem}`);
+      lines.push("- The historical reviewer decision is not a currently verified result. These checks do not provide tamper-proof storage.");
+      if (review) reviewDetails(lines, review, run);
+      else lines.push("- Artifacts: review.json, review.md");
+    } else {
+      lines.push("- Reviewer verdict: not recorded");
+      lines.push(`- ${delivered.problem ?? "Structured review could not be read."}`);
+    }
+    lines.push("", "Verification passed and a reviewer verdict are different evidence. A reviewer verdict does not approve a merge, push, commit, or deployment.");
+  } else if (run.stage === "reviewed" && run.reviewFormat === undefined && existsSync(markdownPath) && !existsSync(jsonPath)) {
+    lines.push("- Format: markdown (legacy)");
+    lines.push("- Reviewer verdict: not recorded");
+    lines.push("- Historical review.md was not validated. Its text is not a structured verdict.");
+    lines.push("- Artifacts: review.md");
+    lines.push("", "A legacy Markdown review does not approve a merge, push, commit, or deployment.");
+  } else {
+    lines.push("- Format: none");
+    lines.push("- Reviewer verdict: not recorded");
+    if (existsSync(markdownPath) || existsSync(jsonPath)) lines.push("- Review files on disk are not a recorded structured verdict.");
+  }
+  return lines.join("\n");
+}
+
+function historicalDecision(run: Run): ReviewVerdict | undefined {
+  if (run.reviewFormat !== "structured" || run.stage !== "reviewed" || !run.reviewJsonHash || !run.reviewMarkdownHash) return undefined;
+  const jsonPath = targetFile(run, "review.json");
+  const markdownPath = targetFile(run, "review.md");
+  if (!existsSync(jsonPath) || !existsSync(markdownPath)) return undefined;
+  const json = content(jsonPath);
+  if (hashText(json) !== run.reviewJsonHash || hashText(content(markdownPath)) !== run.reviewMarkdownHash) return undefined;
+  try {
+    const parsed = JSON.parse(json) as {verdict?: unknown};
+    return (REVIEW_VERDICTS as readonly string[]).includes(String(parsed.verdict)) ? parsed.verdict as ReviewVerdict : undefined;
+  } catch {
+    return undefined;
+  }
+}
+function readDeliveredReview(run: Run): {review?: CodeReview; problem?: string} {
+  if (run.reviewFormat !== "structured" || run.stage !== "reviewed") return {};
+  if (!run.reviewJsonHash || !run.reviewMarkdownHash) return {problem: "Structured review is missing the snapshot recorded at delivery."};
+  const jsonPath = targetFile(run, "review.json");
+  const markdownPath = targetFile(run, "review.md");
+  if (!existsSync(jsonPath) || !existsSync(markdownPath)) return {problem: "Structured review artifacts are missing."};
+  const json = content(jsonPath);
+  const markdown = content(markdownPath);
+  if (hashText(json) !== run.reviewJsonHash || hashText(markdown) !== run.reviewMarkdownHash) {
+    return {problem: "Review artifacts changed after delivery. The stored verdict was not modified to match them."};
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return {problem: "review.json is not valid JSON."};
+  }
+  let expected: string[];
+  try {
+    expected = expectedCriterionIds(run);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return {problem: `Structured review is not fully validated because the approved plan could not be confirmed. ${detail}`};
+  }
+  const evidence: ReviewEvidence = {
+    truncatedDiff: run.reviewDiffTruncated === true,
+    truncatedUntracked: run.reviewUntrackedTruncated === true,
+  };
+  try {
+    const review = validateReview(parsed, expected, evidence);
+    if (renderReview(review) !== markdown) return {problem: "review.md does not match review.json."};
+    return {review};
+  } catch {
+    return {problem: "review.json does not match the review schema."};
+  }
+}
+
+function findingCounts(review: CodeReview): string {
+  return FINDING_SEVERITIES.map(severity => `${severity} ${review.findings.filter(finding => finding.severity === severity).length}`).join(", ");
+}
+
+function coverageCounts(review: CodeReview): string {
+  if (review.acceptanceCriteria.length === 0) return "none supplied";
+  return CRITERION_STATUSES.map(status => `${status} ${review.acceptanceCriteria.filter(criterion => criterion.status === status).length}`).join(", ");
 }
 
 function report(repo: string, id: string): void {
@@ -444,17 +823,18 @@ function report(repo: string, id: string): void {
   const worktree = run.worktree && existsSync(run.worktree) ? run.worktree : null;
   const status = worktree ? git(worktree, ["status", "--short"]) : "(no worktree yet)";
   const changed = worktree ? git(worktree, ["diff", "--stat", run.baseCommit]) : "";
+  const verification = verificationReport(run, repo);
   const reportText = `# Code Agent Workflow Evidence Report\n\n` +
     `- Run: ${run.id}\n- Stage: ${run.stage}\n- Spec source: ${run.specSource}\n- Spec SHA256: ${run.specHash}\n` +
-    `- Base commit: ${run.baseCommit}\n- Provider: ${run.provider}\n- Review provider: ${run.reviewProvider || "not run"}\n` +
+    `- Base commit: ${run.baseCommit}\n- Provider: ${run.provider}\n` +
     `- Plan format: ${run.planFormat ?? "markdown (legacy)"}\n- Human approval recorded: ${run.approvedAt || "NO"}\n- Approved configuration SHA256: ${run.approvedConfigHash || "not approved"}\n- Approved plan SHA256: ${run.approvedPlanHash || "not approved"}\n- Approved plan.json SHA256: ${run.planFormat === "structured" ? (run.approvedPlanJsonHash || "not approved") : "not used"}\n- Verified worktree SHA256: ${run.verifiedWorktreeHash || "not verified"}\n- Branch: ${run.branch}\n- Worktree: ${run.worktree || "not created"}\n\n` +
     `## Reference repositories\n` + (run.references?.length ? run.references.map(reference => `- ${reference.path} @ ${reference.commit}${reference.dirty ? " (dirty at planning)" : ""}`).join("\n") : "- None") +
     `\n\n## Reference files\n` + (run.referenceFiles?.length ? run.referenceFiles.map(file => `- \`${file.path}\` \`${file.sha256}\``).join("\n") : "- None") + "\n\n" +
-    `## Verification\n` + (run.checkResults?.length ? run.checkResults.map(c => `- \`${c.command.join(" ")}\`: ${c.exitCode === 0 ? "PASS" : "FAIL"} (${c.durationMs} ms)`).join("\n") : "No verification recorded") +
-    `\n\n## Change status\n\n\`\`\`\n${status || "(clean)"}\n\`\`\`\n\n## Diff summary (tracked files)\n\n\`\`\`\n${changed || "(none)"}\n\`\`\`\n\n` +
+    `## Verification\n\nVerification passed: ${verification.passed ? "yes" : "no"}\n\n${verification.detail}\n\n` +
+    `${reviewSection(run, verification.problems)}\n\n## Change status\n\n\`\`\`\n${status || "(clean)"}\n\`\`\`\n\n## Diff summary (tracked files)\n\n\`\`\`\n${changed || "(none)"}\n\`\`\`\n\n` +
     `## Events\n` + run.eventLog.map(e => `- ${e.at}: ${e.event}${e.note ? ` — ${e.note}` : ""}`).join("\n") +
-    `\n\n## Artifacts\n\n- spec.md, plan.json (structured runs), plan.md, execution-agent.log, review.md (if available), verify-*.log\n` +
-    `\n**Advisory only:** A passing check and an LLM reviewer do not replace human review, security inspection, and normal CI. No merge, push, deployment, or PR was performed by this tool.\n`;
+    `\n\n## Artifacts\n\n- spec.md, plan.json (structured runs), plan.md, execution-agent.log, review.json and review.md (structured reviews), review.md (legacy reviews), verify-*.log\n` +
+    `\n**Advisory only:** Verification passed and a reviewer verdict are different evidence. A passing check and an LLM reviewer do not replace human review, security inspection, and normal CI. Comparing recorded files does not provide tamper-proof storage. No merge, push, deployment, or PR was performed by this tool.\n`;
   const file = targetFile(run, "REPORT.md");
   writeLocal(file, reportText);
   console.log(`Report: ${file}`);

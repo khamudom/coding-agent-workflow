@@ -1,3 +1,4 @@
+import { escapeDelimiters } from "./markdown.js";
 import type { ReferenceRepo } from "./types.js";
 
 export const guardrails = `
@@ -52,24 +53,38 @@ ${plan}
 ${spec}
 </specification>`;
 }
-export function reviewPrompt(spec: string, plan: string, references: ReferenceRepo[] = []): string {
+export function reviewPrompt(spec: string, plan: string, references: ReferenceRepo[] = [], criterionIds?: readonly string[]): string {
   const referenceNote = references.length === 0
     ? ""
     : `\nReference repositories are read-only evidence. Check that the change reimplements the requested behavior using the target repository's patterns.\n`;
+  const criteria = criterionIds === undefined
+    ? "The approved plan has no structured acceptance-criterion ids. acceptanceCriteria must be an empty array. Do not invent criterion ids. Each findings[].acceptanceCriteria array must be empty."
+    : `The approved plan defines these acceptance-criterion ids: ${criterionIds.join(", ")}.
+acceptanceCriteria must include each of those ids exactly once. status is met, not_met, or uncertain. evidence says what you inspected.
+findings[].acceptanceCriteria lists related ids from that set, or is empty when none apply.`;
   return `ROLE: Independent code reviewer. You are READ ONLY.\n${guardrails}
-Review current changes against the original specification and approved plan.${referenceNote}
-Inspect the diff against the base commit, untracked files, and the source files those changes depend on.
-You may use the provider's built-in read tools and these native read-only commands: ls, rg, cat, and git show.
+Review the current changes against the original specification and the approved plan.${referenceNote}
+Inspect the diff against the approved base commit.
+Inspect relevant source files, including untracked files.
+Compare the changes with the original specification.
+Compare the implementation with the approved plan.
+Evaluate each acceptance criterion. ${criteria}
+Identify regressions, security issues, maintainability problems, accessibility issues, and missing tests.
+Distinguish verified evidence from assumptions. Report missing evidence instead of inventing findings or claims.
+Do not claim that you ran tests. The CAW orchestrator runs the approved verification commands and records their results. You do not run them. A test-related acceptance criterion may be met from that orchestrator evidence. Do not accept the implementer's claims as proof. Verification status does not by itself make the verdict PASS.
+Do not approve a merge, push, commit, or deployment. The verdict is advisory.
+Return one JSON object for the review.
+The output schema is supplied separately. The orchestrator validates the object and writes review.json and review.md. Do not write those files yourself. Do not wrap the object in Markdown.
+verdict is PASS, NEEDS_CHANGES, or INSUFFICIENT_EVIDENCE.
+PASS cannot include critical or high findings, and every acceptance criterion must be met.
+NEEDS_CHANGES must include at least one finding or an acceptance criterion marked not_met.
+If you cannot inspect something the review depends on, use INSUFFICIENT_EVIDENCE and name the missing evidence in unverifiedChecks.
+findings[].path is a repository-relative path, or null when the finding is not about one file. Use null for repository-wide behavior. A deleted file may still be named. Do not invent a path.
+findings[].startLine and findings[].endLine are line numbers starting at 1, or null. A line requires a path. Set endLine only when the finding covers more than one line.
+PASS is accepted only when the tracked diff and the untracked-file list embedded in this prompt are complete. If either one is truncated, do not return PASS. A SHA-256 of the complete diff is not evidence that omitted changes were inspected, and the untracked-file list is not evidence that file contents were read. Use NEEDS_CHANGES when you have an actionable finding, or INSUFFICIENT_EVIDENCE and name the omitted evidence in unverifiedChecks.
+You may inspect the repository with the provider's built-in read tools and with these native read-only commands: ls, rg, cat, and git show.
+When the embedded tracked diff is truncated, you may inspect the omitted changes with the read-only command git diff --no-ext-diff and the approved base commit. That inspection does not make PASS valid. Do not modify files.
 Do not modify files. Do not run tests, builds, installations, project scripts, deployments, or network requests.
-If you cannot inspect a file the review depends on, use verdict INSUFFICIENT_EVIDENCE and name the inspection that failed.
-Focus on correctness, security, regressions, maintainability, type safety,
-accessibility where applicable, and test coverage. Do not claim you ran tests.
-Return Markdown with:
-# Verdict (PASS, NEEDS_CHANGES, or INSUFFICIENT_EVIDENCE)
-# Findings (severity, filename/line, explanation, and suggested fix)
-# Acceptance criteria coverage
-# Recommended follow-ups
-Do not accept the implementer's claims as proof.
 
 <approved-plan>
 ${plan}
@@ -77,4 +92,21 @@ ${plan}
 <specification>
 ${spec}
 </specification>`;
+}
+
+export function verificationEvidencePrompt(checks: readonly {command: readonly string[]; exitCode: number; durationMs: number; log: string}[]): string {
+  const rows = checks.map((check, index) => {
+    const command = escapeDelimiters(check.command.map(arg => JSON.stringify(arg)).join(" "));
+    return `${index + 1}. command: ${command}; exit: ${check.exitCode}; durationMs: ${check.durationMs}; log: ${escapeDelimiters(check.log)}`;
+  });
+  return [
+    "Verification evidence recorded by the CAW orchestrator:",
+    "The CAW orchestrator ran these approved commands. You did not run them. Do not rerun tests, builds, installations, or project scripts.",
+    "You may mark a test-related acceptance criterion met when this evidence shows the relevant command exited 0. Do not treat an implementer's claim as that evidence.",
+    "Overall verification status: passed. This status does not decide code correctness, security, accessibility, or the verdict.",
+    "<verification-evidence>",
+    rows.join("\n"),
+    "</verification-evidence>",
+    "",
+  ].join("\n");
 }

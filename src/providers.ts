@@ -14,26 +14,28 @@ export interface AgentResult {
   durationMs: number;
 }
 
-export interface StructuredPlanRequest {
+export interface StructuredOutputRequest {
   schemaPath: string;
   schema: Record<string, unknown>;
   lastMessagePath: string;
 }
+
+export type StructuredPlanRequest = StructuredOutputRequest;
 
 export function commandFor(
   provider: Provider,
   mode: Mode,
   prompt: string,
   readDirectories: string[] = [],
-  structured?: StructuredPlanRequest,
+  structured?: StructuredOutputRequest,
 ): { bin: string; args: string[] } {
   // Codex treats --add-dir as a writable root. Only the read-only plan and review
   // sandboxes may receive a reference repository; execution must not mount it.
   // --ignore-user-config drops $CODEX_HOME/config.toml. Auth still uses CODEX_HOME.
   const readOnlyAccess = mode === "execute" ? [] : readDirectories;
   // --json streams intermediate events that can already match the schema.
-  // The plan is only the file written by --output-last-message.
-  const planSchema = mode === "plan" ? structured : undefined;
+  // A structured plan or review is only the file written by --output-last-message.
+  const structuredOutput = mode === "plan" || mode === "review" ? structured : undefined;
   if (provider === "codex") {
     return {
       bin: process.env.CAW_CODEX_BIN || "codex",
@@ -44,8 +46,8 @@ export function commandFor(
         "--sandbox",
         mode === "execute" ? "workspace-write" : "read-only",
         ...readOnlyAccess.flatMap(directory => ["--add-dir", directory]),
-        ...(planSchema
-          ? ["--output-schema", planSchema.schemaPath, "--output-last-message", planSchema.lastMessagePath]
+        ...(structuredOutput
+          ? ["--output-schema", structuredOutput.schemaPath, "--output-last-message", structuredOutput.lastMessagePath]
           : []),
         "-",
       ],
@@ -62,8 +64,8 @@ export function commandFor(
       "-p",
       prompt,
       "--output-format",
-      planSchema ? "json" : "text",
-      ...(planSchema ? ["--json-schema", JSON.stringify(planSchema.schema)] : []),
+      structuredOutput ? "json" : "text",
+      ...(structuredOutput ? ["--json-schema", JSON.stringify(structuredOutput.schema)] : []),
       "--permission-mode",
       mode === "plan" ? "plan" : "dontAsk",
       "--tools",
@@ -180,7 +182,7 @@ export async function invokeAgent(
   logFile: string,
   timeoutMinutes: number,
   readDirectories: string[] = [],
-  structured?: StructuredPlanRequest,
+  structured?: StructuredOutputRequest,
 ): Promise<AgentResult> {
   assertMcpPolicy(provider, cwd);
   const { bin, args } = commandFor(provider, mode, prompt, readDirectories, structured);
@@ -241,66 +243,81 @@ export async function invokeAgent(
 }
 
 export function extractPlanDocument(provider: Provider, stdout: string, lastMessagePath: string): unknown {
-  if (provider === "codex") return extractCodexPlan(lastMessagePath);
-  return extractClaudePlan(stdout);
+  return extractStructuredDocument(provider, stdout, lastMessagePath, "plan");
 }
 
-function extractCodexPlan(file: string): unknown {
+export function extractReviewDocument(provider: Provider, stdout: string, lastMessagePath: string): unknown {
+  return extractStructuredDocument(provider, stdout, lastMessagePath, "review");
+}
+
+function extractStructuredDocument(provider: Provider, stdout: string, lastMessagePath: string, artifact: "plan" | "review"): unknown {
+  if (provider === "codex") return extractCodexDocument(lastMessagePath, artifact);
+  return extractClaudeDocument(stdout, artifact);
+}
+
+function extractCodexDocument(file: string, artifact: "plan" | "review"): unknown {
   let text: string;
   try {
     text = readFileSync(file, "utf8");
   } catch (error) {
     if (isNotFound(error)) {
-      throw new Error(
-        `Codex did not write a structured plan to ${file}. Structured planning requires --output-last-message. Stdout was not used as the plan. Upgrade the Codex CLI if that option is unavailable.`,
-      );
+      throw new Error(artifact === "plan"
+        ? `Codex did not write a structured plan to ${file}. Structured planning requires --output-last-message. Stdout was not used as the plan. Upgrade the Codex CLI if that option is unavailable.`
+        : `Codex did not write a structured review to ${file}. Structured review requires --output-last-message. Stdout was not used as the review. Upgrade the Codex CLI if that option is unavailable.`);
     }
     const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`Cannot read the Codex structured plan at ${file} (${detail}).`);
+    throw new Error(artifact === "plan"
+      ? `Cannot read the Codex structured plan at ${file} (${detail}).`
+      : `Cannot read the Codex structured review at ${file} (${detail}).`);
   }
-  return parseJsonObject(text, "Codex last message");
+  return parseJsonObject(text, "Codex last message", artifact);
 }
 
-function extractClaudePlan(stdout: string): unknown {
+function extractClaudeDocument(stdout: string, artifact: "plan" | "review"): unknown {
+  const noun = artifact === "plan" ? "plan" : "review";
+  const requirement = artifact === "plan"
+    ? "Structured planning requires --output-format json and --json-schema."
+    : "Structured review requires --output-format json and --json-schema.";
   let parsed: unknown;
   try {
     parsed = JSON.parse(stdout.replace(/^\uFEFF/, ""));
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(
-      `Claude stdout is not a JSON envelope (${detail}). Diagnostics and Markdown were not accepted as a plan. Structured planning requires --output-format json and --json-schema.`,
-    );
+    throw new Error(`Claude stdout is not a JSON envelope (${detail}). Diagnostics and Markdown were not accepted as a ${noun}. ${requirement}`);
   }
   if (!isRecord(parsed) || parsed.type !== "result") {
-    throw new Error("Claude stdout is not a result envelope. Expected type \"result\" and a structured_output object. A raw plan was not accepted.");
+    throw new Error(`Claude stdout is not a result envelope. Expected type "result" and a structured_output object. A raw ${noun} was not accepted.`);
   }
   if (parsed.is_error === true || (typeof parsed.subtype === "string" && parsed.subtype !== "success")) {
-    throw new Error(`Claude structured output failed (${String(parsed.subtype ?? "error")}). The result text was not accepted as a plan.`);
+    throw new Error(`Claude structured output failed (${String(parsed.subtype ?? "error")}). The result text was not accepted as a ${noun}.`);
   }
   if (!Object.hasOwn(parsed, "structured_output")) {
-    throw new Error("Claude JSON envelope is missing structured_output. The result field was not accepted as a plan.");
+    throw new Error(`Claude JSON envelope is missing structured_output. The result field was not accepted as a ${noun}.`);
   }
   if (!isRecord(parsed.structured_output)) {
-    throw new Error("Claude structured_output must be a JSON object. Strings and other values were not accepted as a plan.");
+    throw new Error(`Claude structured_output must be a JSON object. Strings and other values were not accepted as a ${noun}.`);
   }
   return parsed.structured_output;
 }
 
-function parseJsonObject(text: string, source: string): unknown {
+function parseJsonObject(text: string, source: string, artifact: "plan" | "review"): unknown {
   const trimmed = text.replace(/^\uFEFF/, "").trim();
+  const label = artifact === "plan" ? "structured plan" : "structured review";
   if (!trimmed) {
-    throw new Error(`${source} is empty. Structured planning did not receive a JSON object. Stdout and diagnostics were not used as the plan.`);
+    throw new Error(artifact === "plan"
+      ? `${source} is empty. Structured planning did not receive a JSON object. Stdout and diagnostics were not used as the plan.`
+      : `${source} is empty. Structured review did not receive a JSON object. Stdout and diagnostics were not used as the review.`);
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(trimmed);
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`${source} is not valid JSON (${detail}). Markdown and prose were not accepted as a structured plan.`);
+    throw new Error(`${source} is not valid JSON (${detail}). Markdown and prose were not accepted as a ${label}.`);
   }
   if (!isRecord(parsed)) {
     const kind = parsed === null ? "null" : Array.isArray(parsed) ? "an array" : `a ${typeof parsed}`;
-    throw new Error(`${source} must be a JSON object. ${kind} was not accepted as a structured plan.`);
+    throw new Error(`${source} must be a JSON object. ${kind} was not accepted as a ${label}.`);
   }
   return parsed;
 }

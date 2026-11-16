@@ -50,6 +50,12 @@ export interface Run {
   reviewedAt?: string;
   executionExitCode?: number;
   reviewProvider?: Provider;
+  reviewFormat?: "structured";
+  reviewJsonHash?: string;
+  reviewMarkdownHash?: string;
+  reviewDiffTruncated?: boolean;
+  reviewDiffSha256?: string;
+  reviewUntrackedTruncated?: boolean;
   references?: ReferenceRepo[];
   referenceFiles?: ReferenceFile[];
   checkResults?: CheckResult[];

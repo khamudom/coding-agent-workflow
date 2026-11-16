@@ -13,7 +13,7 @@ This is v0.1. It is a local tool, not a hosted platform. The test suite drives a
 3. You read `plan.md` and approve that exact snapshot. `plan.json` is approved with it.
 4. The implementer edits an isolated Git branch and worktree.
 5. The verification commands in `.code-agent-workflow.json` must pass.
-6. A fresh read-only reviewer reports findings. Its verdict does not approve the change.
+6. A fresh read-only reviewer returns a schema version 1 review. `caw` validates it and writes `review.json` and `review.md`. The verdict does not approve the change.
 7. You review the diff and use your normal pull request, CI, and merge process.
 
 `caw` does not push, commit, merge, deploy, or install dependencies.
@@ -147,6 +147,61 @@ Planning records SHA-256 hashes of the generated `plan.json` and `plan.md`. Appr
 
 Runs saved before this contract have no `planFormat`. They still approve and execute from `plan.md`. `caw plan` always sets `planFormat` to `structured`, including when planning fails, so a new run cannot skip validation by keeping only Markdown.
 
+## Structured reviews
+
+`review.json` is the canonical review for every new `caw review`. `review.md` is generated from that object. The reviewer is not asked to write either file.
+
+Schema version 1 requires a verdict, summary, findings, acceptance-criteria coverage, unverified checks, and follow-ups. The verdict is exactly one of `PASS`, `NEEDS_CHANGES`, or `INSUFFICIENT_EVIDENCE`.
+
+- `PASS` means the reviewer reported no critical or high findings and marked every structured acceptance criterion `met`. Medium, low, and info findings can still appear. This is not approval to merge, push, commit, or deploy.
+- `NEEDS_CHANGES` means the reviewer named at least one finding or marked a criterion `not_met`. A valid needs-changes review is a successful delivery. It is not a provider failure.
+- `INSUFFICIENT_EVIDENCE` means the reviewer could not establish the review and listed the missing evidence in `unverifiedChecks`. It stays visible in the report and is never treated as a pass.
+
+Finding severity is `critical`, `high`, `medium`, `low`, or `info`. Critical and high findings block `PASS`. Each finding has a stable id, an explanation, and a suggested fix. `path` is a repository-relative file path, or `null` for repository-wide behavior. A deleted file may still be named. `startLine` and `endLine` are optional line locations; a line requires a path.
+
+For a structured plan, coverage uses the acceptance-criterion ids already stored in `plan.json`. Every id appears once, with status `met`, `not_met`, or `uncertain`. A legacy plan has no structured ids. Its review uses an empty `acceptanceCriteria` array and does not invent ids.
+
+`caw review` asks Codex for `--output-schema` and reads only `--output-last-message`. It does not use `--json`. Claude is asked for `--output-format json` and `--json-schema`. The review is the envelope's `structured_output` field. The `result` string is not the review. Both are validated again locally. Invalid JSON, an unsupported schema version, a bad verdict, duplicate finding ids, an unsafe path, an unknown or missing acceptance criterion, or a verdict that contradicts the findings is rejected. `caw` does not rewrite the verdict to make it valid. A first failed review becomes `review_failed`, keeps the agent log, and does not publish `review.json` or `review.md`. A failed re-review leaves the last delivered review, its hashes, provider, and delivery time unchanged and records the failure in the event log. `review.json` and `review.md` are replaced together only after the new review validates. Verification that passed remains a separate fact from the reviewer verdict.
+
+Before the reviewer starts, `caw` checks that the recorded verification belongs to this approved run: the commands match the approved configuration, every command exited 0, the verification logs are the run's own `verify-*.log` files, and the worktree still matches the verified hash. The prompt then lists those commands, exit codes, durations, and log names. It does not copy the log text. The reviewer may treat a test-related acceptance criterion as met from that orchestrator evidence. An implementer's claim is not that evidence, and a passing verification does not force `PASS`. If the record is missing or inconsistent, `caw` stops and does not describe verification as passing.
+
+The tracked diff embedded in the review prompt is limited to 120,000 characters. The untracked-file list is limited to 120,000 characters and is cut on whole paths. When either limit omits evidence, the prompt says so. The reviewer may still read omitted tracked changes with read-only `git diff --no-ext-diff` and may inspect untracked source files with read-only tools. Those permissions do not make the embedded evidence complete. `PASS` is rejected whenever the tracked diff or the untracked-file list was truncated. A SHA-256 of the complete diff may be stored on the run as diagnostic provenance of the captured bytes. It does not establish that the reviewer inspected the omitted changes, and the file list does not establish that file contents were read. `NEEDS_CHANGES` and `INSUFFICIENT_EVIDENCE` can still be delivered. `caw` does not rewrite a rejected `PASS`.
+
+`caw report` shows a current structured verdict only when `review.json` and `review.md` still match their delivery hashes, the approved plan still passes the same snapshot checks used at approval, and the recorded verification still matches the approved commands, logs, and worktree snapshot. A changed plan, exit code, command list, or missing log leaves the delivered review in place and labels that verdict as a historical decision, not a currently verified result. When the prompt evidence was truncated, the report says so and does not treat a diff fingerprint as review coverage. Historical reviews that only have `review.md` stay readable. These comparisons are not tamper-proof storage.
+
+Example review:
+
+```json
+{
+  "schemaVersion": 1,
+  "verdict": "NEEDS_CHANGES",
+  "summary": "Escape closes the dialog, and the focus trap test is missing.",
+  "findings": [
+    {
+      "id": "missing-focus-test",
+      "severity": "high",
+      "path": "src/dialog.test.ts",
+      "startLine": null,
+      "endLine": null,
+      "explanation": "The diff adds an Escape handler and does not add a test that focus stays inside the dialog.",
+      "suggestedFix": "Add a test that opens the dialog and checks focus does not leave it.",
+      "acceptanceCriteria": ["escape-closes"]
+    }
+  ],
+  "acceptanceCriteria": [
+    {
+      "id": "escape-closes",
+      "status": "met",
+      "evidence": "src/dialog.ts listens for Escape and calls close()."
+    }
+  ],
+  "unverifiedChecks": ["The reviewer did not run the test suite."],
+  "followUps": ["Ask a person to retry the dialog with a keyboard."]
+}
+```
+
+Runs reviewed before this contract have `review.md` and no `review.json`. `caw report` reads that file as an unstructured historical review. It does not parse a verdict from the Markdown and does not treat the word PASS as a validated verdict. Re-running `caw review` on an older verified run writes a new structured review. No existing run has to be migrated.
+
 A small plan with no reference repository:
 
 ```json
@@ -189,10 +244,10 @@ Specification file or prompt
 [Configured verification commands]
     |
     v
-[Reviewer: fresh read-only session, advisory only]
+[Reviewer: fresh read-only session] -> review.json + review.md
     |
     v
-[HUMAN: review the diff and merge through the normal process]
+[HUMAN: verdict is advisory; review the diff and merge through the normal process]
 ```
 
 Separate runs can use separate worktrees and terminals. Version 0.1 does not schedule subagents inside one task, retry failed work, resolve branch conflicts, or merge results.
@@ -215,7 +270,10 @@ Separate runs can use separate worktrees and terminals. Version 0.1 does not sch
       execution-agent.log
       verify-1.log
       review-agent.log
-      review.md
+      review.schema.json           # schema passed to the reviewer
+      review-last-message.json     # Codex final message, when Codex is the reviewer
+      review.json                  # canonical structured review
+      review.md                    # Markdown generated from review.json
       REPORT.md
 ```
 
@@ -238,9 +296,10 @@ Codex receives `--ignore-user-config`. Authentication still uses `CODEX_HOME`, a
 5. Run logs can contain source code or sensitive data. The run directory is gitignored. Remove sensitive content before sharing a report. `caw` uploads no telemetry. The provider CLI may send repository content to its service under your account settings.
 6. Provider calls have a configurable wall-clock timeout. The tool does not record token cost or enforce a spending limit.
 7. The worktree fingerprint detects ordinary tracked and untracked changes between verification and review. It is not a tamper-proof attestation.
-8. Reviewer findings are advisory. An AI reviewer can miss defects. Read the diff and rely on independent CI before merging.
+8. Reviewer findings are advisory. `PASS`, `NEEDS_CHANGES`, and `INSUFFICIENT_EVIDENCE` describe the review that was delivered. None of them approves a merge, push, commit, or deployment. Verification passed is a separate record from a reviewer verdict of PASS. An AI reviewer can miss defects. Read the diff and rely on independent CI before merging.
 9. Automated tests use a mock agent. Run `caw doctor` and test the real provider on a disposable repository before using it for important work.
-10. `plan.json` is a structural contract, not evidence that the plan is true or good. `caw` checks the schema version, required fields, identifiers, acceptance-criterion links, argv command shape, and cited reference files. It does not check that a "verified" observation was read, that a suggested command passes, or that the design is sound. Suggested verification commands are not run and do not change `.code-agent-workflow.json`. Older runs with no `planFormat` stay Markdown-only. Reviewer output is still unvalidated Markdown.
+10. `plan.json` is a structural contract, not evidence that the plan is true or good. `caw` checks the schema version, required fields, identifiers, acceptance-criterion links, argv command shape, and cited reference files. It does not check that a "verified" observation was read, that a suggested command passes, or that the design is sound. Suggested verification commands are not run and do not change `.code-agent-workflow.json`. Older runs with no `planFormat` stay Markdown-only.
+11. `review.json` is a structural contract, not evidence that the findings are true. `caw` checks the schema version, verdict, required text, finding ids, severity, paths, line ranges, and acceptance-criterion coverage. It checks that `PASS` does not include a critical or high finding or a criterion that is not `met`, that `NEEDS_CHANGES` names a finding or an unmet criterion, and that `INSUFFICIENT_EVIDENCE` lists missing evidence. It rejects `PASS` when the embedded tracked diff or untracked-file list was truncated. A stored diff SHA-256 identifies the captured diff and does not prove the omitted text was reviewed. It does not check that a file was read, that a line exists, that a test was run, or that the suggested fix is right. The reviewer does not run tests. Older runs with only `review.md` stay unvalidated Markdown.
 
 ## Testing
 
@@ -248,7 +307,7 @@ Codex receives `--ignore-user-config`. Authentication still uses `CODEX_HOME`, a
 npm test
 ```
 
-The tests cover specification validation, structured plan validation, provider permission arguments, local MCP preflight checks, subprocess environment isolation, binary overrides, the approval gate, worktree isolation, verification, review, reference-file checks, legacy Markdown runs, and rejection of a reference repository that changes during planning. `npm test` does not invoke Codex or Claude. MCP coverage is three separate kinds of evidence. Argument tests record the command this process builds. They do not prove that an installed binary honored the MCP flags. Local preflight tests reject project and host configuration this process can inspect, and they refuse the run when Git discovery or a configuration read fails. Real-provider checks live in `tests/mcp-provider-probe.test.ts` and stay skipped until you opt in. On a disposable machine with no Codex login, keyring entry, or managed policy, run:
+The tests cover specification validation, structured plan validation, structured review validation, provider permission arguments, local MCP preflight checks, subprocess environment isolation, binary overrides, the approval gate, worktree isolation, verification, review, reference-file checks, legacy Markdown runs, and rejection of a reference repository that changes during planning. `npm test` does not invoke Codex or Claude. MCP coverage is three separate kinds of evidence. Argument tests record the command this process builds. They do not prove that an installed binary honored the MCP flags. Local preflight tests reject project and host configuration this process can inspect, and they refuse the run when Git discovery or a configuration read fails. Real-provider checks live in `tests/mcp-provider-probe.test.ts` and stay skipped until you opt in. On a disposable machine with no Codex login, keyring entry, or managed policy, run:
 
 ```bash
 CAW_MCP_PROVIDER_PROBE=1 npm test
